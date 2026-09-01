@@ -1,0 +1,33 @@
+diff --git a/cmd/gomobile/bind.go b/cmd/gomobile/bind.go
+--- a/cmd/gomobile/bind.go
++++ b/cmd/gomobile/bind.go
+@@ -84,7 +84,7 @@ func runBind(cmd *command) error {
+ 		return fmt.Errorf(`invalid -target=%q: %v`, buildTarget, err)
+ 	}
+ 
+-	if !mobileModuleAvailable() {
++	if os.Getenv("GOMOBILE_LOCAL_MODULE_DIR") == "" && !mobileModuleAvailable() {
+ 		fmt.Fprintln(os.Stderr, `gomobile bind requires golang.org/x/mobile in the current module, but it is not in the module dependency graph.
+ 
+ Add it with:
+@@ -344,6 +344,20 @@ func writeGoMod(dir, targetPlatform, targetArch string) error {
+ 	if !m {
+ 		return nil
+ 	}
++	// A bound module can have a very large module graph containing unrelated
++	// tool dependencies. In local-module mode, keep the generated JNI module
++	// limited to the bound package and the x/mobile bind runtime.
++	if mainDir, runtimeDir := os.Getenv("GOMOBILE_LOCAL_MODULE_DIR"), os.Getenv("GOMOBILE_BIND_RUNTIME_DIR"); mainDir != "" && runtimeDir != "" {
++		mainPath := os.Getenv("GOMOBILE_LOCAL_MODULE_PATH")
++		if mainPath == "" {
++			return errors.New("GOMOBILE_LOCAL_MODULE_PATH is required with local module mode")
++		}
++		contents := fmt.Sprintf(
++			"module gobind\n\ngo 1.26.6\n\nrequire (\n\t%s v0.0.0\n\tgolang.org/x/mobile v0.0.0\n)\n\nreplace %s => %s\nreplace golang.org/x/mobile => %s\n",
++			mainPath, mainPath, mainDir, runtimeDir,
++		)
++		return os.WriteFile(filepath.Join(dir, "go.mod"), []byte(contents), 0o644)
++	}
+ 
+ 	return writeFile(filepath.Join(dir, "go.mod"), func(w io.Writer) error {
+ 		f, err := getModuleVersions(targetPlatform, targetArch, ".")

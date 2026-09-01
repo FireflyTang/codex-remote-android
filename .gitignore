@@ -1,0 +1,6 @@
+/.tools/
+/.work/android/
+/.gradle/
+/.kotlin/
+/local.properties
+**/build/
