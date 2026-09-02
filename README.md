@@ -2,6 +2,8 @@
 
 面向个人 Demo 的 Android 原生客户端。第一版聚焦最短可用链路：在 Android 设备内运行 Tailnet，并连接 Codex Remote Host。
 
+使用问题可在 Issue 中通过小写 `@codex` 请求协助。
+
 ## 当前范围
 
 - Android 16（API 36）
