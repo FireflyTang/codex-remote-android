@@ -41,12 +41,16 @@ Extra Gradle arguments replace the default task, for example:
 scripts/android/build.sh :app:assembleRelease
 ```
 
-The AVD is a practical approximation of a vivo X200 Ultra: API 36, x86_64,
-1440x3200 at 510 dpi, 4 cores, 4 GiB RAM, and a 12 GiB data partition. This is
-not a vendor firmware/device-behavior replica. `emulator-start.sh` is headless by
-default; pass `--window` for a GUI. It prints the guest page size after boot, so
-16 KB mode is evidence-based rather than inferred from the package name. KVM is
-used automatically by the Android emulator when `/dev/kvm` is accessible.
+The AVD is a resource-conscious approximation of a vivo X200 Ultra: API 36,
+x86_64, 1080x2400 at 420 dpi, 2 cores, 2 GiB RAM, and a 256 MiB VM heap. The
+existing data-partition setting is left unchanged. This is not a vendor
+firmware/device-behavior replica.
+`emulator-start.sh` updates these keys in an existing AVD before every start, so
+an older high-memory profile does not silently remain active. It is headless by
+default; pass `--window` for a GUI. It prints the effective profile and guest
+page size after boot, so 16 KB mode is evidence-based rather than inferred from
+the package name. KVM is used automatically by the Android emulator when
+`/dev/kvm` is accessible.
 
 At the latest validation, the official API 36 x86_64 16 KB image was not
 available and bootstrap selected `system-images;android-36;google_apis;x86_64`.
@@ -119,6 +123,11 @@ they are slow and large. Stop a running emulator with
 - `ANDROID_API`, `ANDROID_BUILD_TOOLS`, `ANDROID_AVD_NAME`
 - `ANDROID_SDK_ROOT`, `ANDROID_WORK_DIR`, `GRADLE_USER_HOME`
 - `ANDROID_EMULATOR_TIMEOUT` (seconds; default 240)
+- `ANDROID_EMULATOR_RAM_MB` (1024-8192; default 2048)
+- `ANDROID_EMULATOR_CORES` (1-8; default 2)
+- `ANDROID_EMULATOR_WIDTH`, `ANDROID_EMULATOR_HEIGHT` (defaults 1080x2400)
+- `ANDROID_EMULATOR_DENSITY` (120-640; default 420)
+- `ANDROID_EMULATOR_HEAP_MB` (64-1024; default 256)
 
 Background residency, lock-screen/freeze behavior, power-management handling,
 and Clash VPN compatibility are explicitly frozen for the first version. The
