@@ -164,6 +164,7 @@ jobs:
           TOOLS_DIR: "${{ vars.ANDROID_TOOLS_DIR }}"
           ANDROID_WORK_DIR: "${{ vars.ANDROID_WORK_DIR }}"
           GO: "${{ vars.ANDROID_TOOLS_DIR }}/go/bin/go"
+          GOFLAGS: "-buildvcs=false"
         run: ../.codex-automation/.github/scripts/run-repo-session.sh
 
       - name: Detect code changes
@@ -192,6 +193,7 @@ jobs:
           TOOLS_DIR: "${{ vars.ANDROID_TOOLS_DIR }}"
           ANDROID_WORK_DIR: "${{ vars.ANDROID_WORK_DIR }}"
           GO: "${{ vars.ANDROID_TOOLS_DIR }}/go/bin/go"
+          GOFLAGS: "-buildvcs=false"
         run: |
           source scripts/android/env.sh
           scripts/android/test.sh

@@ -65,6 +65,7 @@ class WorkflowTests(unittest.TestCase):
             "TOOLS_DIR": "${{ vars.ANDROID_TOOLS_DIR }}",
             "ANDROID_WORK_DIR": "${{ vars.ANDROID_WORK_DIR }}",
             "GO": "${{ vars.ANDROID_TOOLS_DIR }}/go/bin/go",
+            "GOFLAGS": "-buildvcs=false",
         }
         steps = self.document["jobs"]["codex"]["steps"]
         for name in (
