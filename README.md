@@ -38,9 +38,9 @@ APK 中 arm64 native ELF 的 `LOAD` segment 对齐为 `0x4000`，且该 native �
 
 ## 下载 APK
 
-第一版个人 Demo 可从 [GitHub Release v0.1.1](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.1.1)
-下载 `codex-remote-android-v0.1.1-debug.apk`，或使用
-[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.1.1/codex-remote-android-v0.1.1-debug.apk)。
+当前个人 Demo 可从 [GitHub Release v0.2.0](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.2.0)
+下载 `codex-remote-android-v0.2.0-debug.apk`，或使用
+[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.2.0/codex-remote-android-v0.2.0-debug.apk)。
 这是便于试用的 debug APK，并非商店签名的正式发行包。
 
 ## 构建
