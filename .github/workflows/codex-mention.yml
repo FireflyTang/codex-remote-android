@@ -161,6 +161,9 @@ jobs:
           CODEX_PROMPT_FILE: ${{ runner.temp }}/codex-mention-prompt.md
           CODEX_SELECTION_INPUT_FILE: ${{ runner.temp }}/codex-current-instruction.txt
           CODEX_OUTPUT_FILE: ${{ runner.temp }}/codex-final.md
+          TOOLS_DIR: "${{ vars.ANDROID_TOOLS_DIR }}"
+          ANDROID_WORK_DIR: "${{ vars.ANDROID_WORK_DIR }}"
+          GO: "${{ vars.ANDROID_TOOLS_DIR }}/go/bin/go"
         run: ../.codex-automation/.github/scripts/run-repo-session.sh
 
       - name: Detect code changes
@@ -186,8 +189,9 @@ jobs:
         continue-on-error: true
         working-directory: worktree
         env:
-          TOOLS_DIR: ${{ vars.ANDROID_TOOLS_DIR }}
-          ANDROID_WORK_DIR: ${{ vars.ANDROID_WORK_DIR }}
+          TOOLS_DIR: "${{ vars.ANDROID_TOOLS_DIR }}"
+          ANDROID_WORK_DIR: "${{ vars.ANDROID_WORK_DIR }}"
+          GO: "${{ vars.ANDROID_TOOLS_DIR }}/go/bin/go"
         run: |
           source scripts/android/env.sh
           scripts/android/test.sh

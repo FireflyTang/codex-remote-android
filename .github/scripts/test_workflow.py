@@ -61,8 +61,21 @@ class WorkflowTests(unittest.TestCase):
             "runs-on: [self-hosted, linux, x64, codex-remote-android]", self.text
         )
         self.assertIn("CODEX_HOME: ${{ vars.CODEX_HOME }}", self.text)
-        self.assertIn("TOOLS_DIR: ${{ vars.ANDROID_TOOLS_DIR }}", self.text)
-        self.assertIn("ANDROID_WORK_DIR: ${{ vars.ANDROID_WORK_DIR }}", self.text)
+        expected_tools = {
+            "TOOLS_DIR": "${{ vars.ANDROID_TOOLS_DIR }}",
+            "ANDROID_WORK_DIR": "${{ vars.ANDROID_WORK_DIR }}",
+            "GO": "${{ vars.ANDROID_TOOLS_DIR }}/go/bin/go",
+        }
+        steps = self.document["jobs"]["codex"]["steps"]
+        for name in (
+            "Run the repository's persistent Codex session",
+            "Verify changed code",
+        ):
+            step = next(step for step in steps if step.get("name") == name)
+            self.assertEqual(
+                {key: step["env"].get(key) for key in expected_tools},
+                expected_tools,
+            )
 
     def test_headless_verification_and_publication_routes(self) -> None:
         self.assertIn("source scripts/android/env.sh", self.text)
