@@ -1,10 +1,18 @@
 package com.firefly.codexremote
 
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -13,6 +21,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import org.commonmark.ext.autolink.AutolinkExtension
 import org.commonmark.ext.gfm.strikethrough.StrikethroughExtension
 import org.commonmark.node.BlockQuote
@@ -50,17 +60,93 @@ internal fun MarkdownBody(
     style: TextStyle = MaterialTheme.typography.bodyMedium,
 ) {
     val text = markdown.ifBlank { emptyText }
-    val rendered = remember(text) { renderMarkdown(text) }
-    SelectionContainer {
-        Text(rendered, style = style)
+    val codeBackground = MaterialTheme.colorScheme.surfaceVariant
+    val linkColor = MaterialTheme.colorScheme.primary
+    val blocks = remember(text, codeBackground, linkColor) {
+        renderMarkdownBlocks(text, codeBackground, linkColor)
+    }
+    Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)) {
+        blocks.forEach { block ->
+            when (block) {
+                is MarkdownUiBlock.RichText -> SelectionContainer {
+                    Text(block.text, style = style)
+                }
+                is MarkdownUiBlock.CodeBlock -> Surface(
+                    Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(9.dp),
+                    color = codeBackground,
+                ) {
+                    SelectionContainer {
+                        Text(
+                            block.code,
+                            Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 11.dp, vertical = 10.dp),
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 14.sp,
+                                lineHeight = 20.sp,
+                            ),
+                            softWrap = false,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
-internal fun renderMarkdown(markdown: String): AnnotatedString =
-    runCatching { MarkdownComposer().compose(markdownParser.parse(markdown)) }
+internal sealed interface MarkdownUiBlock {
+    data class RichText(val text: AnnotatedString) : MarkdownUiBlock
+    data class CodeBlock(val code: String, val info: String) : MarkdownUiBlock
+}
+
+internal fun renderMarkdownBlocks(
+    markdown: String,
+    codeBackground: Color = Color(0xFFECE7DC),
+    linkColor: Color = Color(0xFF0B57D0),
+): List<MarkdownUiBlock> = runCatching {
+    val root = markdownParser.parse(markdown)
+    buildList {
+        var current = root.firstChild
+        var richStart: Node? = null
+        fun flushRich(stopBefore: Node?) {
+            richStart?.let { start ->
+                MarkdownComposer(codeBackground, linkColor).composeRange(start, stopBefore)
+                    .takeIf { it.isNotBlank() }
+                    ?.let { add(MarkdownUiBlock.RichText(it)) }
+            }
+            richStart = null
+        }
+        while (current != null) {
+            val next = current.next
+            when (val node = current) {
+                is FencedCodeBlock -> {
+                    flushRich(node)
+                    add(MarkdownUiBlock.CodeBlock(node.literal.trimEnd(), node.info.orEmpty()))
+                }
+                is IndentedCodeBlock -> {
+                    flushRich(node)
+                    add(MarkdownUiBlock.CodeBlock(node.literal.trimEnd(), ""))
+                }
+                else -> if (richStart == null) richStart = node
+            }
+            current = next
+        }
+        flushRich(null)
+    }
+}.getOrElse { listOf(MarkdownUiBlock.RichText(AnnotatedString(markdown))) }
+
+internal fun renderMarkdown(
+    markdown: String,
+    codeBackground: Color = Color(0xFFECE7DC),
+    linkColor: Color = Color(0xFF0B57D0),
+): AnnotatedString =
+    runCatching { MarkdownComposer(codeBackground, linkColor).compose(markdownParser.parse(markdown)) }
         .getOrElse { AnnotatedString(markdown) }
 
-private class MarkdownComposer {
+private class MarkdownComposer(
+    private val codeBackground: Color,
+    private val linkColor: Color,
+) {
     private val builder = AnnotatedString.Builder()
 
     fun compose(root: Node): AnnotatedString {
@@ -68,12 +154,17 @@ private class MarkdownComposer {
         return builder.toAnnotatedString()
     }
 
-    private fun renderBlockSequence(node: Node?, listDepth: Int) {
+    fun composeRange(first: Node, stopBefore: Node?): AnnotatedString {
+        renderBlockSequence(first, 0, stopBefore)
+        return builder.toAnnotatedString()
+    }
+
+    private fun renderBlockSequence(node: Node?, listDepth: Int, stopBefore: Node? = null) {
         var current = node
-        while (current != null) {
+        while (current != null && current !== stopBefore) {
             renderBlock(current, listDepth)
             current = current.next
-            if (current != null && !endsWith("\n\n")) {
+            if (current != null && current !== stopBefore && !endsWith("\n\n")) {
                 if (!endsWith('\n')) builder.append('\n')
                 builder.append('\n')
             }
@@ -88,10 +179,10 @@ private class MarkdownComposer {
             }
             is BulletList -> renderBulletList(node, listDepth)
             is OrderedList -> renderOrderedList(node, listDepth)
-            is FencedCodeBlock -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+            is FencedCodeBlock -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBackground)) {
                 builder.append(node.literal.trimEnd())
             }
-            is IndentedCodeBlock -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+            is IndentedCodeBlock -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBackground)) {
                 builder.append(node.literal.trimEnd())
             }
             is BlockQuote -> {
@@ -170,14 +261,14 @@ private class MarkdownComposer {
                 is Code -> withStyle(
                     SpanStyle(
                         fontFamily = FontFamily.Monospace,
-                        background = Color(0xFFECE7DC),
+                        background = codeBackground,
                     ),
                 ) {
                     builder.append(currentNode.literal)
                 }
                 is Link -> withStyle(
                     SpanStyle(
-                        color = Color(0xFF0B57D0),
+                        color = linkColor,
                         textDecoration = TextDecoration.Underline,
                     ),
                 ) {

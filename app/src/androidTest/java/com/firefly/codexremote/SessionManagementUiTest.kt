@@ -39,7 +39,7 @@ class SessionManagementUiTest {
 
         compose.onNodeWithTag("project-path").assertIsDisplayed()
         compose.onNodeWithText("上一级").assertIsDisplayed()
-        compose.onNodeWithText("📁 demo").assertIsDisplayed()
+        compose.onNodeWithText("demo").assertIsDisplayed()
         compose.onNodeWithText("查看此目录下可导入会话").assertIsDisplayed()
         compose.onNodeWithText("可继续，点击导入").assertIsDisplayed()
         compose.onNodeWithText("新建此项目").assertIsDisplayed()

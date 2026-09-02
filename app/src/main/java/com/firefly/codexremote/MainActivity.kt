@@ -11,6 +11,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,21 +21,42 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.Notes
+import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.outlined.*
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.*
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
@@ -143,7 +167,7 @@ class MainActivity : ComponentActivity() {
                     downloadTargetCommandId = ""
                 }
             }
-            MaterialTheme {
+            CodexRemoteTheme {
                 CodexRemoteScreen(
                     state, viewModel::setHostAddress, viewModel::connect, viewModel::refresh,
                     { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it))) },
@@ -178,6 +202,24 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun ConversationTab(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier.fillMaxHeight().selectable(selected = selected, onClick = onClick, role = Role.Tab),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(label, color = if (selected) CodexColors.Indigo else CodexColors.TextMuted, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+        Spacer(Modifier.height(7.dp))
+        Box(Modifier.width(48.dp).height(3.dp).clip(CircleShape).background(if (selected) CodexColors.Indigo else Color.Transparent))
     }
 }
 
@@ -218,7 +260,10 @@ fun CodexRemoteScreen(
     onSubmitUserInput: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    Surface(modifier.fillMaxSize().semantics { testTagsAsResourceId = true }) {
+    Surface(
+        modifier.fillMaxSize().semantics { testTagsAsResourceId = true },
+        color = CodexColors.Graphite,
+    ) {
         if (state.openCodexId != null) {
             BackHandler(onBack = if (state.conversationPage == ConversationPage.WORKSPACE) onShowConversation else onCloseConversation)
             ConversationScreen(
@@ -259,30 +304,51 @@ private fun HomeScreen(
     onForgetCodex: (String) -> Unit,
 ) {
     Column(
-        Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 40.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 34.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("Codex Remote", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
-        Text("通过 Tailnet 连接你的 Codex Host", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Surface(Modifier.size(42.dp), CircleShape, color = CodexColors.IndigoSoft) {
+                Icon(Icons.Rounded.Terminal, null, Modifier.padding(9.dp), tint = CodexColors.Indigo)
+            }
+            Column {
+                Text("Codex Remote", style = MaterialTheme.typography.headlineMedium)
+                Text("Tailnet 开发工作台", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
         StatusCard(state.core)
         OutlinedTextField(
             state.hostAddress, onHostAddressChanged, Modifier.fillMaxWidth(),
             label = { Text("Host 地址") },
+            leadingIcon = { Icon(Icons.Rounded.Dns, null) },
             supportingText = { Text(state.core.error.ifBlank { phaseDescription(state.core.phase) }) },
             isError = state.core.error.isNotBlank(), singleLine = true,
         )
         Button(
-            onConnect, Modifier.fillMaxWidth(),
+            onConnect, Modifier.fillMaxWidth().heightIn(min = 52.dp),
             enabled = state.hostAddress.isNotBlank() && state.core.phase !in BusyPhases,
-        ) { Text(if (state.core.phase == "ready") "重新连接" else "连接") }
-        if (state.core.authUrl.isNotBlank()) {
-            Button({ onOpenAuth(state.core.authUrl) }, Modifier.fillMaxWidth()) { Text("打开 Tailscale 登录") }
+        ) {
+            Icon(Icons.Rounded.Link, null)
+            Spacer(Modifier.width(8.dp))
+            Text(if (state.core.phase == "ready") "重新连接" else "连接")
         }
-        Button(
+        if (state.core.authUrl.isNotBlank()) {
+            OutlinedButton({ onOpenAuth(state.core.authUrl) }, Modifier.fillMaxWidth().heightIn(min = 50.dp)) {
+                Icon(Icons.Rounded.OpenInBrowser, null)
+                Spacer(Modifier.width(8.dp))
+                Text("打开 Tailscale 登录")
+            }
+        }
+        FilledTonalButton(
             onOpenProject,
-            Modifier.fillMaxWidth().testTag("open-project"),
+            Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("open-project"),
             enabled = state.core.phase == "ready",
-        ) { Text("打开项目") }
+        ) {
+            Icon(Icons.Rounded.FolderOpen, null)
+            Spacer(Modifier.width(8.dp))
+            Text("打开项目")
+        }
         CodexList(state.core, onRefresh, onOpenConversation, onRenameCodex, onUnmanageCodex, onForgetCodex)
     }
 }
@@ -290,14 +356,23 @@ private fun HomeScreen(
 @Composable
 private fun StatusCard(state: CoreState) {
     val ready = state.phase == "ready" || state.phase in ConversationPhases
-    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+    Surface(
+        Modifier.fillMaxWidth().border(1.dp, CodexColors.Border, MaterialTheme.shapes.medium),
+        color = CodexColors.Charcoal,
+        shape = MaterialTheme.shapes.medium,
+    ) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Surface(Modifier.size(10.dp), CircleShape, color = if (ready) Color(0xFF2E7D32) else Color(0xFF8A8A94), content = {})
-            Spacer(Modifier.width(10.dp))
-            Column {
-                Text("Tailnet 状态", fontWeight = FontWeight.Medium)
-                Text(phaseDescription(state.phase), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (state.tailnetIPs.isNotEmpty()) Text(state.tailnetIPs.joinToString(), style = MaterialTheme.typography.bodySmall)
+            Surface(Modifier.size(38.dp), CircleShape, color = if (ready) Color(0xFF15372F) else CodexColors.Raised) {
+                Icon(
+                    if (ready) Icons.Rounded.CheckCircle else Icons.Rounded.CloudOff,
+                    null, Modifier.padding(9.dp), tint = if (ready) CodexColors.Green else CodexColors.TextMuted,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Tailnet", style = MaterialTheme.typography.titleMedium)
+                Text(phaseDescription(state.phase), color = if (ready) CodexColors.Green else CodexColors.TextMuted)
+                if (state.tailnetIPs.isNotEmpty()) Text(state.tailnetIPs.joinToString(), style = MaterialTheme.typography.bodySmall, color = CodexColors.TextMuted)
             }
         }
     }
@@ -314,12 +389,16 @@ internal fun CodexList(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text("Codex", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-            if (core.phase == "ready") Button(onRefresh) { Text("刷新") }
+            Text("最近会话", style = MaterialTheme.typography.titleLarge)
+            if (core.phase == "ready") IconButton(onRefresh, Modifier.semantics { contentDescription = "刷新会话" }) {
+                Icon(Icons.Rounded.Refresh, "刷新")
+            }
         }
         if (core.codexes.isEmpty()) {
-            Card(Modifier.fillMaxWidth()) {
+            Surface(Modifier.fillMaxWidth().border(1.dp, CodexColors.Border, MaterialTheme.shapes.medium), color = CodexColors.Charcoal, shape = MaterialTheme.shapes.medium) {
                 Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Rounded.Forum, null, Modifier.size(32.dp), tint = CodexColors.TextMuted)
+                    Spacer(Modifier.height(10.dp))
                     Text(if (core.phase == "ready") "Host 暂无 Codex" else "暂无 Codex 会话")
                     if (core.phase != "ready") Text("连接 Host 后将在这里显示", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -329,30 +408,41 @@ internal fun CodexList(
             var menuExpanded by remember(codex.id) { mutableStateOf(false) }
             var renameOpen by remember(codex.id) { mutableStateOf(false) }
             var renameTitle by remember(codex.id, codex.title) { mutableStateOf(title) }
-            Card(
+            Surface(
                 Modifier.fillMaxWidth().testTag("codex-item-${codex.id}")
                     .semantics { contentDescription = "打开会话：$title" }
-                    .clickable { onOpenConversation(codex.id) },
+                    .clip(MaterialTheme.shapes.medium)
+                    .clickable { onOpenConversation(codex.id) }
+                    .border(1.dp, CodexColors.Border, MaterialTheme.shapes.medium),
+                color = CodexColors.Charcoal,
+                shape = MaterialTheme.shapes.medium,
             ) {
-                Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(title, Modifier.weight(1f), fontWeight = FontWeight.Medium)
+                        Surface(Modifier.size(34.dp), CircleShape, color = CodexColors.IndigoSoft) {
+                            Text("C", Modifier.wrapContentSize(Alignment.Center), color = CodexColors.Indigo, fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Box {
                             IconButton(
                                 { menuExpanded = true },
                                 Modifier.testTag("codex-menu-${codex.id}").semantics { contentDescription = "会话操作：$title" },
-                            ) { Text("⋮", style = MaterialTheme.typography.titleLarge) }
+                            ) { Icon(Icons.Rounded.MoreVert, "更多操作") }
                             DropdownMenu(menuExpanded, { menuExpanded = false }) {
                                 DropdownMenuItem(
                                     text = { Text("重命名") },
+                                    leadingIcon = { Icon(Icons.Rounded.Edit, null) },
                                     onClick = { menuExpanded = false; renameOpen = true },
                                 )
                                 DropdownMenuItem(
                                     text = { Text("休眠") },
+                                    leadingIcon = { Icon(Icons.Rounded.Bedtime, null) },
                                     onClick = { menuExpanded = false; onUnmanageCodex(codex.id) },
                                 )
                                 DropdownMenuItem(
                                     text = { Text("忘记记录") },
+                                    leadingIcon = { Icon(Icons.Rounded.DeleteOutline, null) },
                                     onClick = { menuExpanded = false; onForgetCodex(codex.id) },
                                 )
                             }
@@ -397,7 +487,13 @@ internal fun ProjectDialog(
     val busy = core.phase in ProjectBusyPhases || state.pendingProjectCommandId.isNotBlank()
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("打开项目") },
+        containerColor = CodexColors.Charcoal,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Rounded.FolderOpen, null, tint = CodexColors.Indigo)
+                Text("打开项目")
+            }
+        },
         text = {
             Column(
                 Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
@@ -405,31 +501,36 @@ internal fun ProjectDialog(
             ) {
                 OutlinedTextField(
                     state.projectPath, onPathChanged, Modifier.fillMaxWidth().testTag("project-path"),
-                    label = { Text("当前路径") }, singleLine = true,
+                    label = { Text("当前路径") },
+                    leadingIcon = { Icon(Icons.Rounded.Folder, null) }, singleLine = true,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
                         { parentProjectPath(state.projectPath)?.let(onListDirectories) },
                         enabled = !busy && parentProjectPath(state.projectPath) != null,
-                    ) { Text("上一级") }
+                    ) { Icon(Icons.Rounded.ArrowUpward, null); Spacer(Modifier.width(6.dp)); Text("上一级") }
                     OutlinedButton(
                         { onListDirectories(state.projectPath) },
                         enabled = !busy && state.projectPath.isNotBlank(),
-                    ) { Text("浏览此路径") }
+                    ) { Icon(Icons.Rounded.Search, null); Spacer(Modifier.width(6.dp)); Text("浏览") }
                 }
                 if (core.phase == "loading_directories") LinearProgressIndicator(Modifier.fillMaxWidth())
                 core.directoryListing?.directories.orEmpty().forEach { directory ->
                     TextButton(
                         { onListDirectories(directory.path) },
                         Modifier.fillMaxWidth().testTag("project-directory-${directory.name}"),
-                    ) { Text("📁 ${directory.name.ifBlank { directory.path }}", Modifier.fillMaxWidth()) }
+                    ) {
+                        Icon(Icons.Rounded.Folder, null, tint = CodexColors.Indigo)
+                        Spacer(Modifier.width(10.dp))
+                        Text(directory.name.ifBlank { directory.path }, Modifier.fillMaxWidth())
+                    }
                 }
                 HorizontalDivider()
                 Button(
                     onListCandidates,
                     Modifier.fillMaxWidth().testTag("list-session-candidates"),
                     enabled = !busy && state.projectPath.isNotBlank(),
-                ) { Text("查看此目录下可导入会话") }
+                ) { Icon(Icons.Rounded.History, null); Spacer(Modifier.width(8.dp)); Text("查看此目录下可导入会话") }
                 if (core.phase == "loading_session_candidates") LinearProgressIndicator(Modifier.fillMaxWidth())
                 core.sessionCandidates?.sessions.orEmpty().forEach { candidate ->
                     SessionCandidateRow(candidate, busy, onImport, onOpenManaged)
@@ -439,7 +540,7 @@ internal fun ProjectDialog(
                     onCreate,
                     Modifier.fillMaxWidth().testTag("create-codex"),
                     enabled = !busy && state.projectPath.isNotBlank(),
-                ) { Text(if (core.phase == "creating_codex") "新建中…" else "新建此项目") }
+                ) { Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(if (core.phase == "creating_codex") "新建中…" else "新建此项目") }
             }
         },
         confirmButton = {},
@@ -462,8 +563,11 @@ private fun SessionCandidateRow(
         resumable -> { -> onImport(candidate.sessionId, candidate.source) }
         else -> null
     }
-    Card(
-        Modifier.fillMaxWidth().then(if (action != null && !busy) Modifier.clickable(onClick = action) else Modifier),
+    Surface(
+        Modifier.fillMaxWidth().border(1.dp, CodexColors.Border, MaterialTheme.shapes.small)
+            .then(if (action != null && !busy) Modifier.clickable(onClick = action) else Modifier),
+        color = CodexColors.Raised,
+        shape = MaterialTheme.shapes.small,
     ) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(candidate.title.ifBlank { candidate.sessionId.ifBlank { "未命名会话" } }, fontWeight = FontWeight.Medium)
@@ -517,32 +621,41 @@ private fun ConversationScreen(
             },
     ) {
         Row(
-            Modifier.fillMaxWidth().padding(start = 8.dp, end = 16.dp, top = 28.dp, bottom = 8.dp),
+            Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 74.dp)
+                .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (state.conversationPage == ConversationPage.CONVERSATION) {
-                TextButton(
+                IconButton(
                     onBack, Modifier.testTag("conversation-back").semantics { contentDescription = "返回会话列表" },
-                ) { Text("返回") }
+                ) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回会话列表") }
             } else {
-                TextButton(
+                IconButton(
                     onShowConversation,
                     Modifier.testTag("workspace-back").semantics { contentDescription = "返回会话" },
-                ) { Text("返回会话") }
+                ) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回会话") }
             }
-            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(Modifier.size(7.dp), CircleShape, color = if (core.error.isBlank()) CodexColors.Green else CodexColors.Error) {}
+                    Text(if (core.error.isBlank()) "已连接" else "连接异常", style = MaterialTheme.typography.labelMedium, color = if (core.error.isBlank()) CodexColors.Green else CodexColors.Error)
+                }
+            }
+            Spacer(Modifier.width(48.dp))
         }
+        Row(Modifier.fillMaxWidth().height(52.dp)) {
+            ConversationTab("会话", state.conversationPage == ConversationPage.CONVERSATION, Modifier.weight(1f).testTag("show-conversation"), onShowConversation)
+            ConversationTab("项目文件", state.conversationPage == ConversationPage.WORKSPACE, Modifier.weight(1f).testTag("show-workspace"), onShowWorkspace)
+        }
+        HorizontalDivider(color = CodexColors.Border)
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            Modifier.fillMaxWidth().height(18.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (state.conversationPage == ConversationPage.CONVERSATION) {
-                Button(onShowConversation, Modifier.weight(1f).testTag("show-conversation")) { Text("会话") }
-                OutlinedButton(onShowWorkspace, Modifier.weight(1f).testTag("show-workspace")) { Text("项目文件") }
-            } else {
-                OutlinedButton(onShowConversation, Modifier.weight(1f).testTag("show-conversation")) { Text("会话") }
-                Button(onShowWorkspace, Modifier.weight(1f).testTag("show-workspace")) { Text("项目文件") }
-            }
+            Box(Modifier.width(if (state.conversationPage == ConversationPage.CONVERSATION) 32.dp else 18.dp).height(4.dp).clip(CircleShape).background(if (state.conversationPage == ConversationPage.CONVERSATION) CodexColors.Indigo else CodexColors.Border))
+            Box(Modifier.width(if (state.conversationPage == ConversationPage.WORKSPACE) 32.dp else 18.dp).height(4.dp).clip(CircleShape).background(if (state.conversationPage == ConversationPage.WORKSPACE) CodexColors.Indigo else CodexColors.Border))
         }
         if (state.conversationPage == ConversationPage.CONVERSATION) {
             Column(
@@ -569,30 +682,46 @@ private fun ConversationScreen(
                     submittingRequestIds = state.submittingRequestIds,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Row(
-                    Modifier.fillMaxWidth().testTag("conversation-composer").padding(12.dp),
-                    verticalAlignment = Alignment.Bottom,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                Surface(
+                    Modifier.fillMaxWidth().testTag("conversation-composer")
+                        .navigationBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp),
+                    shape = RoundedCornerShape(28.dp),
+                    color = CodexColors.Composer,
+                    border = BorderStroke(1.dp, CodexColors.Border),
                 ) {
-                    OutlinedTextField(
-                        state.draft, onDraftChanged,
-                        Modifier.weight(1f).testTag("conversation-input")
-                            .semantics { contentDescription = "消息输入框" },
-                        placeholder = { Text("输入消息") }, minLines = 1, maxLines = 5,
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = 18.dp, end = 5.dp, top = 4.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                    BasicTextField(
+                        value = state.draft,
+                        onValueChange = onDraftChanged,
+                        modifier = Modifier.weight(1f).heightIn(min = 44.dp, max = 120.dp)
+                            .testTag("conversation-input").semantics { contentDescription = "消息输入框" },
                         enabled = conversation?.running != true,
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(color = CodexColors.Text),
+                        cursorBrush = SolidColor(CodexColors.Indigo),
+                        minLines = 1,
+                        maxLines = 5,
+                        decorationBox = { inner ->
+                            Box(Modifier.fillMaxWidth().heightIn(min = 44.dp), contentAlignment = Alignment.CenterStart) {
+                                if (state.draft.isBlank()) Text("输入消息", color = CodexColors.TextMuted)
+                                inner()
+                            }
+                        },
                     )
                     if (conversation?.running == true) {
-                        Button(
-                            onStop,
-                            Modifier.testTag("conversation-stop").semantics { contentDescription = "停止任务" },
+                        FilledIconButton(
+                            onStop, Modifier.size(50.dp).testTag("conversation-stop").semantics { contentDescription = "停止任务" },
                             enabled = !state.stoppingTurn,
-                        ) { Text(if (state.stoppingTurn) "停止中" else "停止") }
+                        ) { Icon(Icons.Rounded.Stop, if (state.stoppingTurn) "停止中" else "停止") }
                     } else {
-                        Button(
-                            onSend,
-                            Modifier.testTag("conversation-send").semantics { contentDescription = "发送消息" },
+                        FilledIconButton(
+                            onSend, Modifier.size(50.dp).testTag("conversation-send").semantics { contentDescription = "发送消息" },
                             enabled = state.draft.isNotBlank() && conversation != null && core.phase !in BusyPhases,
-                        ) { Text("发送") }
+                        ) { Icon(Icons.AutoMirrored.Outlined.Send, "发送") }
+                    }
                     }
                 }
             }
@@ -665,9 +794,17 @@ private fun ApprovalRequestCard(
     onRespond: (String, String) -> Unit,
 ) {
     val submitting = request.inFlight || localSubmitting
-    Card(Modifier.fillMaxWidth().testTag("approval-${request.requestId}")) {
+    Surface(
+        Modifier.fillMaxWidth().testTag("approval-${request.requestId}")
+            .border(1.dp, CodexColors.Amber.copy(alpha = .55f), MaterialTheme.shapes.medium),
+        color = CodexColors.Charcoal,
+        shape = MaterialTheme.shapes.medium,
+    ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(request.title.ifBlank { "需要批准" }, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Rounded.AdminPanelSettings, null, tint = CodexColors.Amber)
+                Text(request.title.ifBlank { "需要批准" }, fontWeight = FontWeight.SemiBold)
+            }
             if (request.explanation.isNotBlank()) Text(request.explanation)
             if (request.command.isNotEmpty()) {
                 SelectionContainer {
@@ -709,9 +846,17 @@ private fun UserInputRequestCard(
     onSubmit: (String) -> Unit,
 ) {
     val submitting = request.inFlight || localSubmitting
-    Card(Modifier.fillMaxWidth().testTag("user-input-${request.requestId}")) {
+    Surface(
+        Modifier.fillMaxWidth().testTag("user-input-${request.requestId}")
+            .border(1.dp, CodexColors.Cyan.copy(alpha = .5f), MaterialTheme.shapes.medium),
+        color = CodexColors.Charcoal,
+        shape = MaterialTheme.shapes.medium,
+    ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Codex 需要你的回答", fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Rounded.QuestionAnswer, null, tint = CodexColors.Cyan)
+                Text("Codex 需要你的回答", fontWeight = FontWeight.SemiBold)
+            }
             request.questions.forEach { question ->
                 val answer = drafts[question.questionId] ?: UserInputAnswerDraft()
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -803,7 +948,7 @@ internal fun WorkspaceScreen(
 ) {
     val workspace = state.core.workspace
     Column(
-        modifier.padding(horizontal = 16.dp, vertical = 8.dp).testTag("project-files-page")
+        modifier.background(CodexColors.Graphite).padding(horizontal = 16.dp, vertical = 12.dp).testTag("project-files-page")
             .semantics { contentDescription = "项目文件页面" },
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -833,12 +978,12 @@ internal fun WorkspaceScreen(
                         { onChooseUpload("regular_file") },
                         enabled = uploadEnabled,
                         modifier = Modifier.testTag("workspace-upload-file"),
-                    ) { Text("上传文件") }
+                    ) { Icon(Icons.Rounded.UploadFile, null); Spacer(Modifier.width(6.dp)); Text("上传文件") }
                     OutlinedButton(
                         { onChooseUpload("zip_directory") },
                         enabled = uploadEnabled,
                         modifier = Modifier.testTag("workspace-upload-zip"),
-                    ) { Text("上传 ZIP") }
+                    ) { Icon(Icons.Rounded.FolderZip, null); Spacer(Modifier.width(6.dp)); Text("上传 ZIP") }
                 }
                 Text(
                     "上传上限 ${formatByteLimit(workspace.limits.maxInlineUploadBytes)} · 下载上限 ${formatByteLimit(workspace.limits.maxInlineDownloadBytes)}",
@@ -853,7 +998,7 @@ internal fun WorkspaceScreen(
                         { onListWorkspace(parentWorkspacePath(relativeDirectory)) },
                         enabled = relativeDirectory.isNotBlank() && workspace.loading == "none",
                         modifier = Modifier.testTag("workspace-parent"),
-                    ) { Text("上一级") }
+                    ) { Icon(Icons.Rounded.ArrowUpward, null); Spacer(Modifier.width(6.dp)); Text("上一级") }
                     if (workspace.loading == "entries") Text("正在加载…", Modifier.align(Alignment.CenterVertically))
                     if (workspace.loading == "upload") Text("正在上传…", Modifier.align(Alignment.CenterVertically))
                     if (workspace.loading == "download") Text("正在下载…", Modifier.align(Alignment.CenterVertically))
@@ -919,23 +1064,31 @@ private fun WorkspaceEntryRow(
         !entry.textEditable -> "只读文本"
         else -> "可编辑文本"
     }
-    Card(Modifier.fillMaxWidth()) {
+    Surface(
+        Modifier.fillMaxWidth().border(1.dp, CodexColors.Border, MaterialTheme.shapes.small),
+        color = CodexColors.Charcoal,
+        shape = MaterialTheme.shapes.small,
+    ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             TextButton(
                 onClick = { if (directory) onListWorkspace(entry.relativePath) else onOpenFile(entry) },
                 enabled = idle && openable,
                 modifier = Modifier.weight(1f).testTag("workspace-entry-${entry.relativePath}"),
             ) {
-                Column(Modifier.fillMaxWidth()) {
-                    Text((if (directory) "📁 " else "📄 ") + entry.name.ifBlank { entry.relativePath })
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(if (directory) Icons.Rounded.Folder else Icons.Rounded.Description, null, tint = if (directory) CodexColors.Indigo else CodexColors.TextMuted)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.fillMaxWidth()) {
+                    Text(entry.name.ifBlank { entry.relativePath })
                     Text(description, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
             TextButton(
                 { onChooseDownload(entry) },
                 enabled = idle && !localTransferBusy && canStartDownload(workspace) && entry.kind in setOf("regular_file", "directory"),
                 modifier = Modifier.testTag("workspace-download-${entry.relativePath}"),
-            ) { Text("下载") }
+            ) { Icon(Icons.Rounded.Download, "下载") }
         }
     }
 }
@@ -953,6 +1106,7 @@ private fun WorkspaceEditorDialog(
     AlertDialog(
         onDismissRequest = onClose,
         modifier = Modifier.testTag("workspace-editor-dialog"),
+        containerColor = CodexColors.Charcoal,
         title = { Text(entry.name.ifBlank { entry.relativePath }) },
         text = {
             Column(Modifier.fillMaxWidth().heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -968,7 +1122,7 @@ private fun WorkspaceEditorDialog(
                         onEditorChanged,
                         Modifier.weight(1f).fillMaxHeight().testTag("workspace-editor"),
                         enabled = entry.textEditable,
-                        textStyle = MaterialTheme.typography.bodySmall,
+                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                     )
                 }
                 if (!saveAllowed) Text(workspaceSaveUnavailableReason(entry, workspace.accessState), style = MaterialTheme.typography.labelSmall)
@@ -1010,23 +1164,41 @@ internal fun ConversationHistory(core: CoreState, modifier: Modifier = Modifier)
             else -> LazyColumn(
                 Modifier.fillMaxSize(),
                 reverseLayout = true,
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 18.dp),
             ) {
+                val turnsById = conversation!!.turns.associateBy { it.turnId }
+                val displayEntries = groupTimelineEntries(conversation.timelineEntries)
                 itemsIndexed(
-                    conversation.timelineEntries.asReversed(),
+                    displayEntries.asReversed(),
                     key = { index, entry ->
                         when (entry) {
-                            is ConversationTimelineEntry.Item -> entry.item.itemId.ifBlank {
-                                "$index-${entry.item.type}-${entry.item.hashCode()}"
-                            }
-                            is ConversationTimelineEntry.TurnFailure -> "failure-${entry.turnId}-$index"
+                            is TimelineDisplayEntry.Message -> entry.key
+                            is TimelineDisplayEntry.ProcessGroup -> entry.key
+                            is TimelineDisplayEntry.TurnFailure -> "failure-${entry.turnId}-$index"
                         }
                     },
-                ) { _, entry ->
+                ) { index, entry ->
+                    val chronologicalIndex = displayEntries.lastIndex - index
+                    val entryTurnId = entry.timelineTurnId()
+                    val nextTurnId = displayEntries.getOrNull(chronologicalIndex + 1)?.timelineTurnId()
+                    val connectBelow = entryTurnId.isNotBlank() && entryTurnId == nextTurnId
                     when (entry) {
-                        is ConversationTimelineEntry.Item -> TimelineItem(entry.item)
-                        is ConversationTimelineEntry.TurnFailure -> TurnFailureCard(entry.failure)
+                        is TimelineDisplayEntry.Message -> {
+                            val turn = turnsById[entry.item.turnId]
+                            val timestamp = when (entry.item.type) {
+                                "agent_message" -> turn?.completedAtUnixMs?.takeIf { it > 0 }
+                                    ?: turn?.startedAtUnixMs
+                                else -> turn?.startedAtUnixMs
+                            }?.takeIf { it > 0 }?.let(::formatTimelineTime).orEmpty()
+                            TimelineItem(entry.item, timestamp, connectBelow)
+                        }
+                        is TimelineDisplayEntry.ProcessGroup -> {
+                            val turn = turnsById[entry.turnId]
+                            val timestamp = turn?.startedAtUnixMs?.takeIf { it > 0 }
+                                ?.let(::formatTimelineTime).orEmpty()
+                            ProcessGroupCard(entry.items, timestamp, connectBelow)
+                        }
+                        is TimelineDisplayEntry.TurnFailure -> TurnFailureCard(entry.failure)
                     }
                 }
             }
@@ -1034,75 +1206,261 @@ internal fun ConversationHistory(core: CoreState, modifier: Modifier = Modifier)
     }
 }
 
+private fun TimelineDisplayEntry.timelineTurnId(): String = when (this) {
+    is TimelineDisplayEntry.Message -> item.turnId
+    is TimelineDisplayEntry.ProcessGroup -> turnId
+    is TimelineDisplayEntry.TurnFailure -> turnId
+}
+
+internal sealed interface TimelineDisplayEntry {
+    val key: String
+
+    data class Message(val item: ConversationItem, override val key: String) : TimelineDisplayEntry
+    data class ProcessGroup(
+        val turnId: String,
+        val items: List<ConversationItem>,
+        override val key: String,
+    ) : TimelineDisplayEntry
+    data class TurnFailure(val turnId: String, val failure: String, override val key: String) : TimelineDisplayEntry
+}
+
+internal fun groupTimelineEntries(entries: List<ConversationTimelineEntry>): List<TimelineDisplayEntry> = buildList {
+    var groupTurnId = ""
+    var groupStartIndex = -1
+    val groupItems = mutableListOf<ConversationItem>()
+
+    fun flushGroup() {
+        if (groupItems.isEmpty()) return
+        val first = groupItems.first()
+        val last = groupItems.last()
+        add(
+            TimelineDisplayEntry.ProcessGroup(
+                turnId = groupTurnId,
+                items = groupItems.toList(),
+                key = "process-${groupTurnId.ifBlank { "no-turn" }}-$groupStartIndex-${first.itemId}-${last.itemId}",
+            ),
+        )
+        groupItems.clear()
+        groupTurnId = ""
+        groupStartIndex = -1
+    }
+
+    entries.forEachIndexed { index, entry ->
+        when (entry) {
+            is ConversationTimelineEntry.Item -> {
+                val item = entry.item
+                val message = item.type == "user_message" || item.type == "agent_message"
+                if (message) {
+                    flushGroup()
+                    add(
+                        TimelineDisplayEntry.Message(
+                            item,
+                            item.itemId.ifBlank { "message-$index-${item.type}-${item.hashCode()}" },
+                        ),
+                    )
+                } else if (item.turnId.isBlank()) {
+                    flushGroup()
+                    add(
+                        TimelineDisplayEntry.ProcessGroup(
+                            turnId = "",
+                            items = listOf(item),
+                            key = "process-no-turn-$index-${item.itemId.ifBlank { item.hashCode().toString() }}",
+                        ),
+                    )
+                } else {
+                    if (groupItems.isNotEmpty() && groupTurnId != item.turnId) flushGroup()
+                    if (groupItems.isEmpty()) {
+                        groupTurnId = item.turnId
+                        groupStartIndex = index
+                    }
+                    groupItems += item
+                }
+            }
+            is ConversationTimelineEntry.TurnFailure -> {
+                flushGroup()
+                add(TimelineDisplayEntry.TurnFailure(entry.turnId, entry.failure, "failure-${entry.turnId}-$index"))
+            }
+        }
+    }
+    flushGroup()
+}
+
 @Composable
-internal fun TimelineItem(item: ConversationItem) {
+internal fun TimelineItem(item: ConversationItem, timestamp: String = "", connectBelow: Boolean = false) {
     when (item.type) {
-        "user_message" -> MessageBubble("你", item.userMessage?.text.orEmpty(), true, item)
-        "agent_message" -> MessageBubble("Codex", item.agentMessage?.text.orEmpty(), false, item)
-        "plan" -> PlanCard(item)
-        "file_change" -> FileChangeCard(item)
-        else -> ProcessCard(item)
+        "user_message" -> MessageBubble("你", item.userMessage?.text.orEmpty(), true, item, timestamp, connectBelow)
+        "agent_message" -> MessageBubble("Codex", item.agentMessage?.text.orEmpty(), false, item, timestamp, false)
+        else -> ProcessGroupCard(listOf(item), timestamp, connectBelow)
     }
 }
 
 @Composable
-private fun MessageBubble(label: String, text: String, user: Boolean, item: ConversationItem) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (user) Arrangement.End else Arrangement.Start) {
-        Card(
-            Modifier.fillMaxWidth(if (user) 0.86f else 0.94f),
-            colors = CardDefaults.cardColors(containerColor = if (user) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer),
-        ) {
-            Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                    if (item.status == "running") Text("生成中…", style = MaterialTheme.typography.labelSmall)
+private fun MessageBubble(label: String, text: String, user: Boolean, item: ConversationItem, timestamp: String, connectBelow: Boolean) {
+    TimelineRow(
+        connectBelow = connectBelow,
+        leading = {
+            TimelineAvatar(if (user) "你" else "C", if (user) CodexColors.IndigoSoft else Color(0xFF392A6E), if (user) Color(0xFFBBC3FF) else Color(0xFFD6C7FF))
+        },
+    ) {
+        Column(Modifier.fillMaxWidth().padding(top = 2.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(label, style = MaterialTheme.typography.titleMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (item.status == "running") Text("生成中…", style = MaterialTheme.typography.labelSmall, color = CodexColors.Cyan)
                     if (item.status == "failed") Text("失败", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                    if (timestamp.isNotBlank()) Text(timestamp, style = MaterialTheme.typography.labelSmall, color = CodexColors.TextMuted)
                 }
-                MarkdownBody(text, "（空消息）", MaterialTheme.typography.bodyLarge)
-                CompletenessNotice(item.completeness)
             }
+            if (user) {
+                Text(text.ifBlank { "（空消息）" }, style = MaterialTheme.typography.bodyLarge, color = CodexColors.Text)
+            } else {
+                MarkdownBody(text, "（空消息）", MaterialTheme.typography.bodyLarge)
+            }
+            CompletenessNotice(item.completeness)
         }
     }
 }
 
 @Composable
-private fun ProcessCard(item: ConversationItem) {
-    val forceOpen = item.status == "running" || item.status == "failed"
-    var expanded by rememberSaveable(item.itemId, item.status) { mutableStateOf(forceOpen) }
-    val title = when (item.type) {
-        "reasoning_summary" -> "思考过程"
-        "command" -> "命令"
-        "tool" -> "工具调用"
-        else -> "过程记录"
+private fun TimelineRow(
+    connectBelow: Boolean,
+    leading: @Composable () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val connectorColor = CodexColors.Border
+    Row(
+        Modifier.fillMaxWidth().height(IntrinsicSize.Min).clipToBounds().drawBehind {
+            if (connectBelow) {
+                val x = 18.dp.toPx()
+                drawLine(connectorColor, Offset(x, 18.dp.toPx()), Offset(x, size.height), 1.dp.toPx())
+            }
+        },
+        verticalAlignment = Alignment.Top,
+    ) {
+        Box(Modifier.width(36.dp).fillMaxHeight()) {
+            Box(Modifier.align(Alignment.TopCenter)) { leading() }
+        }
+        Spacer(Modifier.width(12.dp))
+        Box(Modifier.weight(1f).padding(bottom = 18.dp)) { content() }
     }
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(title, fontWeight = FontWeight.Medium)
-                    ProcessSummary(item)?.let { Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 2) }
+}
+
+@Composable
+private fun TimelineAvatar(text: String, background: Color, foreground: Color) {
+    Surface(Modifier.size(36.dp), CircleShape, color = background) {
+        Text(text, Modifier.wrapContentSize(Alignment.Center), color = foreground, style = MaterialTheme.typography.titleMedium)
+    }
+}
+
+@Composable
+private fun ProcessGroupCard(items: List<ConversationItem>, timestamp: String, connectBelow: Boolean) {
+    if (items.isEmpty()) return
+    TimelineRow(
+        connectBelow = connectBelow,
+        leading = {
+            Surface(Modifier.size(36.dp), CircleShape, color = CodexColors.Raised) {
+                Icon(Icons.Outlined.Terminal, null, Modifier.padding(8.dp), tint = CodexColors.TextMuted)
+            }
+        },
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Codex 正在处理你的请求", style = MaterialTheme.typography.titleMedium)
+                if (timestamp.isNotBlank()) Text(timestamp, style = MaterialTheme.typography.labelSmall, color = CodexColors.TextMuted)
+            }
+        Surface(
+            Modifier.fillMaxWidth().border(1.dp, CodexColors.Border, MaterialTheme.shapes.small),
+            color = CodexColors.Charcoal,
+            shape = MaterialTheme.shapes.small,
+        ) {
+            Column {
+                items.forEachIndexed { index, item ->
+                    ProcessGroupRow(item, "")
+                    if (index != items.lastIndex) HorizontalDivider(color = CodexColors.Border)
                 }
-                Text(statusDescription(item.status), style = MaterialTheme.typography.labelSmall, color = statusColor(item.status))
-                Spacer(Modifier.width(6.dp))
-                TextButton({ expanded = !expanded }) { Text(if (expanded) "收起" else "展开") }
+            }
+        }
+        }
+    }
+}
+
+@Composable
+private fun ProcessGroupRow(item: ConversationItem, timestamp: String) {
+    val forceOpen = item.status == "running" || item.status == "failed"
+    var manuallyExpanded by rememberSaveable(item.itemId, item.status) { mutableStateOf(false) }
+    val expanded = forceOpen || manuallyExpanded
+    val title = processTitle(item.type)
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(processIcon(item.type), null, Modifier.size(20.dp), tint = statusColor(item.status))
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                    ProcessSummary(item)?.let {
+                        Text(it, style = MaterialTheme.typography.labelMedium, color = CodexColors.TextMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                Text(
+                    listOf(statusDescription(item.status), timestamp).filter { it.isNotBlank() }.joinToString(" · "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColor(item.status),
+                )
+                IconButton(
+                    { if (!forceOpen) manuallyExpanded = !manuallyExpanded },
+                    Modifier.size(48.dp).semantics { contentDescription = if (expanded) "收起$title" else "展开$title" },
+                ) {
+                    Icon(if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null)
+                }
             }
             if (expanded) {
-                when (item.type) {
-                    "reasoning_summary" -> MarkdownBody(item.reasoningSummary?.text.orEmpty(), "暂无思考摘要")
-                    "command" -> CommandBody(item.command)
-                    "tool" -> ToolBody(item.tool)
-                    else -> Text("暂不支持的过程记录", style = MaterialTheme.typography.bodySmall)
+                Column(Modifier.fillMaxWidth().padding(start = 44.dp, end = 12.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    when (item.type) {
+                        "reasoning_summary" -> MarkdownBody(item.reasoningSummary?.text.orEmpty(), "暂无思考摘要")
+                        "command" -> CommandBody(item.command)
+                        "tool" -> ToolBody(item.tool)
+                        "plan" -> PlanBody(item)
+                        "file_change" -> FileChangeBody(item)
+                        else -> Text("暂不支持的过程记录", style = MaterialTheme.typography.bodySmall)
+                    }
+                    CompletenessNotice(item.completeness)
                 }
-                CompletenessNotice(item.completeness)
             }
-        }
     }
+}
+
+private fun processTitle(type: String): String = when (type) {
+    "reasoning_summary" -> "思考过程"
+    "command" -> "命令"
+    "tool" -> "工具调用"
+    "plan" -> "计划"
+    "file_change" -> "文件变更"
+    else -> "过程记录"
+}
+
+private fun processIcon(type: String): ImageVector = when (type) {
+    "reasoning_summary" -> Icons.Outlined.Search
+    "command" -> Icons.Outlined.Terminal
+    "tool" -> Icons.Outlined.Build
+    "plan" -> Icons.Outlined.Checklist
+    "file_change" -> Icons.Outlined.Description
+    else -> Icons.AutoMirrored.Outlined.Notes
 }
 
 private fun ProcessSummary(item: ConversationItem): String? = when (item.type) {
     "command" -> item.command?.argv?.joinToString(" ")?.ifBlank { "命令内容为空" }
     "tool" -> item.tool?.name?.ifBlank { "未命名工具" }
     "reasoning_summary" -> if (item.status == "running") "正在思考" else null
+    "plan" -> item.plan?.steps?.let { "${it.size} 个步骤" }
+    "file_change" -> item.fileChange?.changes?.let { changes ->
+        when (changes.size) {
+            0 -> "暂无文件摘要"
+            1 -> {
+                val change = changes.first()
+                "${fileKindDescription(change.kind)} ${change.path.ifBlank { change.newPath.ifBlank { change.oldPath } }}"
+            }
+            else -> "修改 ${changes.size} 个文件"
+        }
+    }
     else -> null
 }
 
@@ -1126,42 +1484,40 @@ private fun ToolBody(tool: ToolItem?) {
 @Composable
 private fun SelectableBody(text: String, emptyText: String) {
     SelectionContainer {
-        Text(text.ifBlank { emptyText }, style = MaterialTheme.typography.bodyMedium)
-    }
-}
-
-@Composable
-private fun PlanCard(item: ConversationItem) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("计划", fontWeight = FontWeight.Medium)
-                Text(statusDescription(item.status), style = MaterialTheme.typography.labelSmall, color = statusColor(item.status))
-            }
-            val steps = item.plan?.steps.orEmpty()
-            if (steps.isEmpty()) Text("暂无步骤", style = MaterialTheme.typography.bodySmall)
-            steps.forEach { step ->
-                Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    Text(planStepMark(step.status), fontWeight = FontWeight.SemiBold)
-                    Text(step.text.ifBlank { "未命名步骤" }, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                    Text(planStepDescription(step.status), style = MaterialTheme.typography.labelSmall)
-                }
-            }
-            CompletenessNotice(item.completeness)
+        Surface(color = CodexColors.Raised, shape = MaterialTheme.shapes.extraSmall) {
+            Text(
+                text.ifBlank { emptyText },
+                Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+            )
         }
     }
 }
 
 @Composable
-private fun FileChangeCard(item: ConversationItem) {
+private fun PlanBody(item: ConversationItem) {
+            val steps = item.plan?.steps.orEmpty()
+            if (steps.isEmpty()) Text("暂无步骤", style = MaterialTheme.typography.bodySmall)
+            steps.forEach { step ->
+                Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                    Icon(planStepIcon(step.status), null, Modifier.size(18.dp), tint = statusColor(step.status))
+                    Text(step.text.ifBlank { "未命名步骤" }, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                    Text(planStepDescription(step.status), style = MaterialTheme.typography.labelSmall)
+                }
+            }
+}
+
+private fun planStepIcon(status: String): ImageVector = when (status) {
+    "completed" -> Icons.Rounded.CheckCircle
+    "running", "in_progress" -> Icons.Rounded.PlayCircle
+    "failed" -> Icons.Rounded.Cancel
+    else -> Icons.Rounded.RadioButtonUnchecked
+}
+
+@Composable
+private fun FileChangeBody(item: ConversationItem) {
     var diffExpanded by rememberSaveable(item.itemId) { mutableStateOf(false) }
     val fileChange = item.fileChange
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("文件变更", fontWeight = FontWeight.Medium)
-                Text(statusDescription(item.status), style = MaterialTheme.typography.labelSmall, color = statusColor(item.status))
-            }
             val changes = fileChange?.changes.orEmpty()
             if (changes.isEmpty()) Text("暂无文件摘要", style = MaterialTheme.typography.bodySmall)
             changes.forEach { change ->
@@ -1175,14 +1531,11 @@ private fun FileChangeCard(item: ConversationItem) {
                 TextButton({ diffExpanded = !diffExpanded }) { Text(if (diffExpanded) "收起差异" else "查看差异") }
                 if (diffExpanded) SelectableBody(fileChange!!.unifiedDiff, "")
             }
-            CompletenessNotice(item.completeness)
-        }
-    }
 }
 
 @Composable
 private fun TurnFailureCard(failure: String) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+    Surface(color = MaterialTheme.colorScheme.errorContainer, shape = MaterialTheme.shapes.small) {
         Column(Modifier.padding(14.dp)) {
             Text("本轮执行失败", fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onErrorContainer)
             SelectionContainer { Text(failure, color = MaterialTheme.colorScheme.onErrorContainer) }
@@ -1206,6 +1559,7 @@ private fun CompletenessNotice(completeness: ItemCompleteness?) {
 private fun statusColor(status: String): Color = when (status) {
     "failed" -> MaterialTheme.colorScheme.error
     "running" -> MaterialTheme.colorScheme.primary
+    "completed" -> CodexColors.Green
     else -> MaterialTheme.colorScheme.onSurfaceVariant
 }
 
@@ -1217,19 +1571,15 @@ private fun statusDescription(status: String) = when (status) {
     else -> ""
 }
 
-private fun planStepMark(status: String) = when (status) {
-    "completed" -> "✓"
-    "running", "in_progress" -> "●"
-    "failed" -> "×"
-    else -> "○"
-}
-
 private fun planStepDescription(status: String) = when (status) {
     "completed" -> "完成"
     "running", "in_progress" -> "进行中"
     "failed" -> "失败"
     else -> "待处理"
 }
+
+private fun formatTimelineTime(unixMs: Long): String =
+    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(unixMs))
 
 private fun fileKindDescription(kind: String) = when (kind) {
     "added" -> "新增"
@@ -1304,7 +1654,7 @@ internal fun parentProjectPath(path: String): String? {
 @Preview(showBackground = true, locale = "zh")
 @Composable
 private fun PreviewScreen() {
-    MaterialTheme {
+    CodexRemoteTheme {
         CodexRemoteScreen(
             AppUiState(), {}, {}, {}, {}, {}, {}, {}, {}, {},
             {}, {}, {}, {}, {}, {}, { _, _ -> }, { _, _ -> }, {}, {},

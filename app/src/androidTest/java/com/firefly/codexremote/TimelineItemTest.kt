@@ -7,6 +7,7 @@ import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import org.junit.Rule
@@ -33,7 +34,7 @@ class TimelineItemTest {
         }
 
         compose.onAllNodesWithText("先检查状态").assertCountEquals(0)
-        compose.onNodeWithText("展开").performClick()
+        compose.onNodeWithContentDescription("展开思考过程").performClick()
         compose.onNodeWithText("先检查状态").assertIsDisplayed()
     }
 
@@ -54,7 +55,7 @@ class TimelineItemTest {
         }
         compose.onNodeWithText("测试失败").assertIsDisplayed()
         compose.onNodeWithText("退出码：1").assertIsDisplayed()
-        compose.onNodeWithText("收起").assertIsDisplayed()
+        compose.onNodeWithContentDescription("收起命令").assertIsDisplayed()
     }
 
     @Test
@@ -115,11 +116,29 @@ class TimelineItemTest {
             }
         }
 
-        compose.onNodeWithText("修改  Main.kt").assertIsDisplayed()
+        compose.onNodeWithText("修改 Main.kt").assertIsDisplayed()
         compose.onAllNodesWithText("@@ -1 +1 @@\n-old\n+new").assertCountEquals(0)
+        compose.onAllNodesWithText("查看差异").assertCountEquals(0)
+        compose.onNodeWithContentDescription("展开文件变更").performClick()
         compose.onNodeWithText("查看差异").performClick()
         compose.onNodeWithText("@@ -1 +1 @@\n-old\n+new").assertIsDisplayed()
         compose.onNodeWithText("收起差异").assertIsDisplayed()
+    }
+
+    @Test
+    fun runningAndFailedRowsCannotHideRequiredDetail() {
+        val item = ConversationItem(
+            itemId = "running-command",
+            turnId = "turn",
+            type = "command",
+            status = "running",
+            command = CommandItem(listOf("make", "check"), "/work", "仍在执行", false),
+        )
+        compose.setContent { CodexRemoteTheme { TimelineItem(item) } }
+
+        compose.onNodeWithText("仍在执行").assertIsDisplayed()
+        compose.onNodeWithContentDescription("收起命令").performClick()
+        compose.onNodeWithText("仍在执行").assertIsDisplayed()
     }
 
     @Test
@@ -138,7 +157,7 @@ class TimelineItemTest {
             }
         }
 
-        compose.onNodeWithText("展开").performClick()
+        compose.onNodeWithContentDescription("展开思考过程").performClick()
         compose.onNodeWithText("先看 配置").assertIsDisplayed()
     }
 

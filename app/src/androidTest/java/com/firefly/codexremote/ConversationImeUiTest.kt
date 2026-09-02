@@ -100,15 +100,16 @@ class ConversationImeUiTest {
         val composerHidden = bounds("conversation-composer")
         val inputHidden = bounds("conversation-input")
         val hiddenWindowBottom = decorHeight()
+        val navigationBottom = navigationBottomInset()
         val hiddenMeasurements = "root=$rootHidden composer=$composerHidden input=$inputHidden " +
-            "decorHeight=$hiddenWindowBottom density=$density"
+            "decorHeight=$hiddenWindowBottom navigationBottom=$navigationBottom density=$density"
         assertTrue(
             "composer must return to window bottom; $hiddenMeasurements",
             abs(hiddenWindowBottom - composerHidden.bottom) <= 4 * density,
         )
         assertTrue(
             "hidden IME must leave only the normal composer padding; $hiddenMeasurements",
-            hiddenWindowBottom - inputHidden.bottom in (7 * density)..(17 * density),
+            hiddenWindowBottom - navigationBottom - inputHidden.bottom in (7 * density)..(17 * density),
         )
     }
 
@@ -128,6 +129,15 @@ class ConversationImeUiTest {
         compose.runOnUiThread {
             bottom = compose.activity.window.decorView.rootWindowInsets
                 ?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0
+        }
+        return bottom
+    }
+
+    private fun navigationBottomInset(): Int {
+        var bottom = 0
+        compose.runOnUiThread {
+            bottom = compose.activity.window.decorView.rootWindowInsets
+                ?.getInsets(WindowInsets.Type.navigationBars())?.bottom ?: 0
         }
         return bottom
     }
