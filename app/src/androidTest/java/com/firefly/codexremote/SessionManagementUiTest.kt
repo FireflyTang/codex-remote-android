@@ -6,6 +6,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.assertTextContains
 import org.junit.Rule
 import org.junit.Test
 
@@ -42,6 +43,25 @@ class SessionManagementUiTest {
         compose.onNodeWithText("查看此目录下可导入会话").assertIsDisplayed()
         compose.onNodeWithText("可继续，点击导入").assertIsDisplayed()
         compose.onNodeWithText("新建此项目").assertIsDisplayed()
+    }
+
+    @Test
+    fun resolvedRootFallbackIsReachableInProjectPathField() {
+        compose.setContent {
+            MaterialTheme {
+                ProjectDialog(
+                    state = AppUiState(
+                        core = CoreState(phase = "ready"),
+                        projectDialogOpen = true,
+                        projectPath = initialProjectPath(AppUiState()),
+                    ),
+                    onDismiss = {}, onPathChanged = {}, onListDirectories = {},
+                    onListCandidates = {}, onCreate = {}, onImport = { _, _ -> }, onOpenManaged = {},
+                )
+            }
+        }
+
+        compose.onNodeWithTag("project-path").assertTextContains("/")
     }
 
     @Test

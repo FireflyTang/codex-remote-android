@@ -499,7 +499,7 @@ private fun ConversationScreen(
     val core = state.core
     val conversation = activeConversation(state)
     Column(
-        Modifier.fillMaxSize().imePadding()
+        Modifier.fillMaxSize().imePadding().testTag("conversation-root")
             .pointerInput(state.conversationPage, onBack) {
                 detectHorizontalDragGestures(
                     onDragStart = { drag = 0f },
@@ -570,12 +570,14 @@ private fun ConversationScreen(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Row(
-                    Modifier.fillMaxWidth().padding(12.dp),
+                    Modifier.fillMaxWidth().testTag("conversation-composer").padding(12.dp),
                     verticalAlignment = Alignment.Bottom,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     OutlinedTextField(
-                        state.draft, onDraftChanged, Modifier.weight(1f).semantics { contentDescription = "消息输入框" },
+                        state.draft, onDraftChanged,
+                        Modifier.weight(1f).testTag("conversation-input")
+                            .semantics { contentDescription = "消息输入框" },
                         placeholder = { Text("输入消息") }, minLines = 1, maxLines = 5,
                         enabled = conversation?.running != true,
                     )

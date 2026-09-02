@@ -28,7 +28,7 @@ class HostPreferences(context: Context) {
             if (error is IOException) emit(androidx.datastore.preferences.core.emptyPreferences())
             else throw error
         }
-        .map { preferences -> preferences[LastProjectPathKey].orEmpty() }
+        .map { preferences -> normalizeStoredProjectPath(preferences[LastProjectPathKey].orEmpty()) }
 
     suspend fun setHostAddress(value: String) {
         dataStore.edit { preferences ->
@@ -37,7 +37,11 @@ class HostPreferences(context: Context) {
     }
 
     suspend fun setLastProjectPath(value: String) {
-        dataStore.edit { preferences -> preferences[LastProjectPathKey] = value }
+        val normalized = normalizeStoredProjectPath(value)
+        dataStore.edit { preferences ->
+            if (normalized.isEmpty()) preferences.remove(LastProjectPathKey)
+            else preferences[LastProjectPathKey] = normalized
+        }
     }
 
     private companion object {
@@ -45,3 +49,8 @@ class HostPreferences(context: Context) {
         val LastProjectPathKey = stringPreferencesKey("last_project_path")
     }
 }
+
+internal const val LegacyDefaultProjectPath = "/home/user"
+
+internal fun normalizeStoredProjectPath(value: String): String =
+    value.trim().takeUnless { it.isEmpty() || it == LegacyDefaultProjectPath }.orEmpty()

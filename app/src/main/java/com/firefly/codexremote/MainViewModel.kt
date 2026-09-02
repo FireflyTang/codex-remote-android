@@ -27,6 +27,7 @@ data class AppUiState(
     val lastProjectPath: String = "",
     val projectDialogOpen: Boolean = false,
     val projectPath: String = "",
+    val pendingDirectoryCommandId: String = "",
     val pendingProjectCommandId: String = "",
     val conversationPage: ConversationPage = ConversationPage.CONVERSATION,
     val workspaceEditorOpen: Boolean = false,
@@ -114,7 +115,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .put("clientId", clientId)
                 .put("clientRunId", UUID.randomUUID().toString())
                 .put("clientName", "codex-remote-android")
-                .put("clientVersion", "0.1.0")
+                .put("clientVersion", "0.1.1")
             connectCommands(payload).forEach { command ->
                 acceptCoreState(core.dispatch(command.toString()))
             }
@@ -126,13 +127,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openProjectDialog() {
-        val path = uiState.value.lastProjectPath.ifBlank { DefaultProjectPath }
-        _uiState.update { it.copy(projectDialogOpen = true, projectPath = path, pendingProjectCommandId = "") }
+        val path = initialProjectPath(uiState.value)
+        _uiState.update {
+            it.copy(
+                projectDialogOpen = true,
+                projectPath = path,
+                pendingDirectoryCommandId = "",
+                pendingProjectCommandId = "",
+            )
+        }
         listDirectories(path)
     }
 
     fun closeProjectDialog() {
-        _uiState.update { it.copy(projectDialogOpen = false, pendingProjectCommandId = "") }
+        _uiState.update {
+            it.copy(projectDialogOpen = false, pendingDirectoryCommandId = "", pendingProjectCommandId = "")
+        }
     }
 
     fun setProjectPath(value: String) {
@@ -140,18 +150,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun listDirectories(path: String = uiState.value.projectPath) {
-        if (path.isBlank()) return
-        rememberProjectPath(path)
-        _uiState.update { it.copy(projectPath = path) }
+        val requestedPath = path.trim()
+        if (requestedPath.isEmpty()) return
+        val command = coreCommand("list_directories", JSONObject().put("parentPath", requestedPath))
+        _uiState.update {
+            it.copy(projectPath = requestedPath, pendingDirectoryCommandId = command.getString("id"))
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            dispatch("list_directories", JSONObject().put("parentPath", path))
+            acceptCoreState(core.dispatch(command.toString()))
         }
     }
 
     fun listSessionCandidates() {
         val path = uiState.value.projectPath.trim()
         if (path.isEmpty()) return
-        rememberProjectPath(path)
         viewModelScope.launch(Dispatchers.IO) {
             dispatch("list_session_candidates", JSONObject().put("cwd", path))
         }
@@ -160,7 +172,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun createCodex() {
         val path = uiState.value.projectPath.trim()
         if (path.isEmpty()) return
-        rememberProjectPath(path)
         dispatchProjectOperation(
             "create_codex",
             JSONObject().put("cwd", path).put("createDirectoryIfMissing", true),
@@ -187,9 +198,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun forgetCodex(codexId: String) = dispatchCodexAction("forget_codex", codexId)
 
     fun openConversation(codexId: String) {
+        val managedProjectCommand = if (uiState.value.projectDialogOpen) {
+            coreCommand("select_codex", JSONObject().put("codexId", codexId))
+        } else null
         _uiState.update {
             it.copy(
-                openCodexId = codexId,
+                openCodexId = if (managedProjectCommand == null) codexId else it.openCodexId,
+                pendingProjectCommandId = managedProjectCommand?.getString("id") ?: it.pendingProjectCommandId,
                 stoppingTurn = false,
                 conversationPage = ConversationPage.CONVERSATION,
                 workspaceEditorOpen = false,
@@ -217,7 +232,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
-            dispatch("select_codex", JSONObject().put("codexId", codexId))
+            if (managedProjectCommand != null) acceptCoreState(core.dispatch(managedProjectCommand.toString()))
+            else dispatch("select_codex", JSONObject().put("codexId", codexId))
         }
     }
 
@@ -663,15 +679,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         var listWorkspaceAfterGet: Pair<String, String>? = null
         var refreshWorkspaceDirectory: Pair<String, String>? = null
         var recoverWorkspaceAfterUploadFailure: Pair<String, String>? = null
+        var projectPathToRemember: String? = null
         _uiState.update { current ->
+            projectPathToRemember = null
             if (decoded.revision < current.core.revision) {
                 current
             } else {
-                val completedProject = current.projectDialogOpen &&
-                    current.pendingProjectCommandId.isNotBlank() &&
-                    decoded.commandId == current.pendingProjectCommandId &&
-                    decoded.phase == "ready" &&
-                    decoded.selectedCodexId.isNotBlank()
+                val projectCommandOutcome = projectCommandOutcome(current, decoded)
+                val completedProject = projectCommandOutcome == ProjectCommandOutcome.SUCCESS
+                val failedProject = projectCommandOutcome == ProjectCommandOutcome.FAILURE
+                if (completedProject) {
+                    projectPathToRemember = successfulProjectPath(current, decoded)
+                }
+                val directoryResolution = resolveDirectoryResult(
+                    current.projectPath, current.pendingDirectoryCommandId, decoded,
+                )
                 val returnedWorkspace = decoded.workspace
                 val getCompleted = current.pendingWorkspaceGetCommandId.isNotBlank() &&
                     decoded.commandId == current.pendingWorkspaceGetCommandId &&
@@ -737,7 +759,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     } ?: current.submittingRequestIds,
                     projectDialogOpen = if (completedProject) false else current.projectDialogOpen,
-                    pendingProjectCommandId = if (completedProject) "" else current.pendingProjectCommandId,
+                    projectPath = directoryResolution.path,
+                    pendingDirectoryCommandId = directoryResolution.pendingCommandId,
+                    pendingProjectCommandId = if (completedProject || failedProject) "" else current.pendingProjectCommandId,
                     openCodexId = if (completedProject) decoded.selectedCodexId else current.openCodexId,
                     stoppingTurn = current.stoppingTurn && decoded.conversation?.running == true && decoded.error.isBlank(),
                     pendingWorkspaceGetCommandId = if (getCompleted) "" else current.pendingWorkspaceGetCommandId,
@@ -780,6 +804,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 next
             }
         }
+        projectPathToRemember?.let(::rememberProjectPath)
         listWorkspaceAfterGet?.let { (codexId, directory) ->
             viewModelScope.launch(Dispatchers.IO) {
                 val workspace = uiState.value.core.workspace
@@ -815,7 +840,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
-internal const val DefaultProjectPath = "/home/user"
+internal fun initialProjectPath(state: AppUiState): String {
+    normalizeStoredProjectPath(state.lastProjectPath).takeIf { it.isNotBlank() }?.let { return it }
+    state.core.codexes.firstOrNull { it.id == state.openCodexId }?.cwd?.trim()
+        ?.takeIf { it.isNotBlank() }?.let { return it }
+    state.core.codexes.firstOrNull { it.id == state.core.selectedCodexId }?.cwd?.trim()
+        ?.takeIf { it.isNotBlank() }?.let { return it }
+    return state.core.codexes.firstNotNullOfOrNull { codex -> codex.cwd.trim().takeIf { it.isNotBlank() } } ?: "/"
+}
+
+internal fun successfulProjectPath(current: AppUiState, decoded: CoreState): String? {
+    val selectedCwd = decoded.codexes.firstOrNull { it.id == decoded.selectedCodexId }?.cwd.orEmpty()
+    return projectPathToPersist(true, selectedCwd, current.projectPath)
+}
+
+internal enum class ProjectCommandOutcome { NONE, SUCCESS, FAILURE }
+
+internal fun projectCommandOutcome(current: AppUiState, decoded: CoreState): ProjectCommandOutcome {
+    val matches = current.projectDialogOpen && current.pendingProjectCommandId.isNotBlank() &&
+        decoded.commandId == current.pendingProjectCommandId
+    if (!matches) return ProjectCommandOutcome.NONE
+    return when {
+        decoded.phase == "ready" && decoded.selectedCodexId.isNotBlank() -> ProjectCommandOutcome.SUCCESS
+        decoded.error.isNotBlank() -> ProjectCommandOutcome.FAILURE
+        else -> ProjectCommandOutcome.NONE
+    }
+}
+
+internal fun projectPathToPersist(
+    successfulProjectCommand: Boolean,
+    selectedCwd: String,
+    requestedPath: String,
+): String? = if (!successfulProjectCommand) null else
+    sequenceOf(selectedCwd, requestedPath)
+        .map { it.trim() }
+        .firstOrNull { it.isNotBlank() && it != LegacyDefaultProjectPath }
+
+internal data class DirectoryPathResolution(val path: String, val pendingCommandId: String)
+
+internal fun resolveDirectoryResult(
+    currentPath: String,
+    pendingCommandId: String,
+    decoded: CoreState,
+): DirectoryPathResolution {
+    val completed = pendingCommandId.isNotBlank() && decoded.commandId == pendingCommandId &&
+        (decoded.phase == "ready" || decoded.error.isNotBlank())
+    if (!completed) return DirectoryPathResolution(currentPath, pendingCommandId)
+    val hostPath = decoded.directoryListing?.parentPath
+        ?.takeIf { decoded.error.isBlank() && it.isNotBlank() }
+    return DirectoryPathResolution(hostPath ?: currentPath, "")
+}
 
 internal fun activeConversation(state: AppUiState): ConversationState? =
     state.core.conversation?.takeIf { it.codexId == state.openCodexId }
