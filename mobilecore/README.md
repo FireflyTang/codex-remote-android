@@ -26,14 +26,15 @@ Before `start`, Kotlin must implement `Platform`:
   the JSON shape exercised in `interfaces_test.go`. Go registers it with
   Tailscale's `netmon.RegisterInterfaceGetter`, avoiding Android's restricted
   `net.Interfaces`/netlink path.
-- `BindSocketToNetwork(fd)` calls `Network.bindSocket` on the network selected
-  by the Android platform adapter. The first app adapter uses
-  `ConnectivityManager.activeNetwork`; dedicated `NOT_VPN` selection and
-  Clash/VPN coexistence handling are intentionally deferred beyond v1.
+- `BindSocketToNetwork(fd)` accepts the socket without binding it to a specific
+  Android `Network`. The socket follows Android's default route, allowing Clash
+  to apply its configured split-routing rules instead of bypassing or binding
+  directly to the VPN or its physical underlay.
 - `OnState(json)` forwards immutable state snapshots to Kotlin.
 
-Kotlin should send `network_changed` whenever its selected underlying network
-changes:
+Kotlin selects a usable physical `NOT_VPN` network only for netmon metadata and
+sends `network_changed` whenever that metadata changes. This selection does not
+bind traffic to the physical network:
 
 ```json
 {"version":1,"type":"network_changed","payload":{"defaultInterface":"wlan0","defaultGateway":"192.168.1.1"}}

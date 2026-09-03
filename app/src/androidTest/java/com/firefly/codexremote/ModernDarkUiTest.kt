@@ -53,7 +53,26 @@ class ModernDarkUiTest {
         compose.onNodeWithText("Tailnet 开发工作台").assertIsDisplayed()
         compose.onAllNodesWithText("已连接").assertCountEquals(2)
         compose.onNodeWithTag("open-project").assertIsDisplayed()
+        compose.onNodeWithTag("export-diagnostics").assertIsDisplayed()
         compose.onNodeWithContentDescription("刷新会话").assertIsDisplayed()
+    }
+
+    @Test
+    fun connectionErrorShowsReadableDetail() {
+        compose.setContent {
+            CodexRemoteTheme {
+                CodexRemoteScreen(
+                    state = AppUiState(core = CoreState(phase = "error", error = "Host protocol must be 1.0")),
+                    onHostAddressChanged = {}, onConnect = {}, onRefresh = {}, onOpenAuth = {},
+                    onOpenProject = {}, onOpenConversation = {}, onCloseConversation = {},
+                    onDraftChanged = {}, onSend = {}, onStop = {},
+                )
+            }
+        }
+
+        compose.onNodeWithTag("connection-error-detail").assertIsDisplayed()
+        compose.onNodeWithText("连接错误详情").assertIsDisplayed()
+        compose.onNodeWithText("Host protocol must be 1.0").assertIsDisplayed()
     }
 
     @Test
@@ -76,6 +95,7 @@ class ModernDarkUiTest {
         compose.onNodeWithText("已完成修改。", substring = true).assertIsDisplayed()
         compose.onNodeWithContentDescription("展开思考过程").assertIsDisplayed()
         compose.onNodeWithContentDescription("发送消息").assertIsDisplayed()
+        compose.onNodeWithContentDescription("导出诊断日志").assertIsDisplayed()
     }
 
     @Test

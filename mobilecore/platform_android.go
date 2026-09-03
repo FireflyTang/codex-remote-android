@@ -21,7 +21,7 @@ func installPlatformHooks(p Platform) error {
 	})
 	netns.SetAndroidBindToNetworkFunc(func(fd int) error {
 		if !androidPlatform.BindSocketToNetwork(int32(fd)) {
-			return fmt.Errorf("Android Network.bindSocket failed for fd %d", fd)
+			return fmt.Errorf("Android socket routing hook rejected fd %d", fd)
 		}
 		return nil
 	})

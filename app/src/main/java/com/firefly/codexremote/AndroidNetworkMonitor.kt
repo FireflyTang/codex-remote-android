@@ -38,7 +38,7 @@ class AndroidNetworkMonitor(
 
     private fun publishCurrentNetwork() {
         if (!registered) return
-        val network = connectivityManager.activeNetwork
+        val network = selectPhysicalNetworkForMonitoring(connectivityManager)
         val properties = network?.let(connectivityManager::getLinkProperties)
         val defaultInterface = properties?.interfaceName.orEmpty()
         val defaultGateway = properties?.routes

@@ -73,6 +73,7 @@ class MainActivity : ComponentActivity() {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
             val context = LocalContext.current
             val documentIo = remember(context) { AndroidDocumentIo(context.contentResolver) }
+            val diagnosticExporter = remember(context) { DiagnosticExporter(context.applicationContext) }
             val scope = rememberCoroutineScope()
             var downloadTargetDocumentId by rememberSaveable { mutableStateOf("") }
             var downloadTargetPath by rememberSaveable { mutableStateOf("") }
@@ -199,6 +200,19 @@ class MainActivity : ComponentActivity() {
                     },
                     viewModel::respondApproval, viewModel::toggleUserInputOption,
                     viewModel::setUserInputFreeForm, viewModel::submitUserInput,
+                    {
+                        scope.launch {
+                            try {
+                                val export = withContext(Dispatchers.IO) { diagnosticExporter.create() }
+                                viewModel.reportDiagnosticExport(true, "诊断日志已生成，请选择分享方式")
+                                context.startActivity(export.shareIntent)
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                viewModel.reportDiagnosticExport(false, "诊断日志导出失败：${error.message ?: "未知错误"}")
+                            }
+                        }
+                    },
                 )
             }
         }
@@ -258,6 +272,7 @@ fun CodexRemoteScreen(
     onToggleUserInputOption: (String, String, String) -> Unit = { _, _, _ -> },
     onUserInputFreeFormChanged: (String, String, String) -> Unit = { _, _, _ -> },
     onSubmitUserInput: (String) -> Unit = {},
+    onExportDiagnostics: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -273,12 +288,13 @@ fun CodexRemoteScreen(
                 onWorkspaceEditorChanged, onSaveWorkspaceFile, onCloseWorkspaceEditor,
                 onChooseWorkspaceUpload, onChooseWorkspaceDownload,
                 onRespondApproval, onToggleUserInputOption, onUserInputFreeFormChanged,
-                onSubmitUserInput,
+                onSubmitUserInput, onExportDiagnostics,
             )
         } else {
             HomeScreen(
                 state, onHostAddressChanged, onConnect, onRefresh, onOpenAuth, onOpenConversation,
                 onOpenProject, onRenameCodex, onUnmanageCodex, onForgetCodex,
+                onExportDiagnostics,
             )
             if (state.projectDialogOpen) {
                 ProjectDialog(
@@ -302,6 +318,7 @@ private fun HomeScreen(
     onRenameCodex: (String, String) -> Unit,
     onUnmanageCodex: (String) -> Unit,
     onForgetCodex: (String) -> Unit,
+    onExportDiagnostics: () -> Unit,
 ) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState())
@@ -322,9 +339,31 @@ private fun HomeScreen(
             state.hostAddress, onHostAddressChanged, Modifier.fillMaxWidth(),
             label = { Text("Host 地址") },
             leadingIcon = { Icon(Icons.Rounded.Dns, null) },
-            supportingText = { Text(state.core.error.ifBlank { phaseDescription(state.core.phase) }) },
+            supportingText = { Text(phaseDescription(state.core.phase)) },
             isError = state.core.error.isNotBlank(), singleLine = true,
         )
+        if (state.core.phase == "error" && state.core.error.isNotBlank()) {
+            Surface(
+                Modifier.fillMaxWidth().testTag("connection-error-detail"),
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = MaterialTheme.shapes.medium,
+            ) {
+                SelectionContainer {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "连接错误详情",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Text(
+                            state.core.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+            }
+        }
         Button(
             onConnect, Modifier.fillMaxWidth().heightIn(min = 52.dp),
             enabled = state.hostAddress.isNotBlank() && state.core.phase !in BusyPhases,
@@ -332,6 +371,21 @@ private fun HomeScreen(
             Icon(Icons.Rounded.Link, null)
             Spacer(Modifier.width(8.dp))
             Text(if (state.core.phase == "ready") "重新连接" else "连接")
+        }
+        OutlinedButton(
+            onExportDiagnostics,
+            Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("export-diagnostics"),
+        ) {
+            Icon(Icons.Rounded.BugReport, null)
+            Spacer(Modifier.width(8.dp))
+            Text("导出诊断日志")
+        }
+        state.diagnosticMessage.takeIf { it.isNotBlank() }?.let {
+            Text(
+                it,
+                Modifier.testTag("diagnostic-message"),
+                color = if (state.diagnosticFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            )
         }
         if (state.core.authUrl.isNotBlank()) {
             OutlinedButton({ onOpenAuth(state.core.authUrl) }, Modifier.fillMaxWidth().heightIn(min = 50.dp)) {
@@ -598,6 +652,7 @@ private fun ConversationScreen(
     onToggleUserInputOption: (String, String, String) -> Unit,
     onUserInputFreeFormChanged: (String, String, String) -> Unit,
     onSubmitUserInput: (String) -> Unit,
+    onExportDiagnostics: () -> Unit,
 ) {
     var drag by remember { mutableFloatStateOf(0f) }
     val core = state.core
@@ -642,7 +697,17 @@ private fun ConversationScreen(
                     Text(if (core.error.isBlank()) "已连接" else "连接异常", style = MaterialTheme.typography.labelMedium, color = if (core.error.isBlank()) CodexColors.Green else CodexColors.Error)
                 }
             }
-            Spacer(Modifier.width(48.dp))
+            IconButton(
+                onExportDiagnostics,
+                Modifier.testTag("export-diagnostics").semantics { contentDescription = "导出诊断日志" },
+            ) { Icon(Icons.Rounded.BugReport, "导出诊断日志") }
+        }
+        state.diagnosticMessage.takeIf { it.isNotBlank() }?.let {
+            Text(
+                it,
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag("diagnostic-message"),
+                color = if (state.diagnosticFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            )
         }
         Row(Modifier.fillMaxWidth().height(52.dp)) {
             ConversationTab("会话", state.conversationPage == ConversationPage.CONVERSATION, Modifier.weight(1f).testTag("show-conversation"), onShowConversation)

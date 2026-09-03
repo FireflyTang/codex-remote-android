@@ -3,6 +3,7 @@ package mobilecore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,6 +31,25 @@ type snapshot struct {
 }
 
 type productionStarter struct{ platform Platform }
+
+const (
+	hostDialMaxAttempts = 4
+	hostDialRetryDelay  = 500 * time.Millisecond
+)
+
+// hostDialError marks failures that happened before a WebSocket connection was
+// established. A status of zero means that no valid HTTP response was received;
+// that may be transient while a freshly started Tailnet's peer map settles.
+type hostDialError struct {
+	status int
+	err    error
+}
+
+func (e *hostDialError) Error() string {
+	return fmt.Sprintf("dial Host WebSocket (HTTP %d): %v", e.status, e.err)
+}
+
+func (e *hostDialError) Unwrap() error { return e.err }
 
 type liveSession struct {
 	tailnet         *tsnet.Server
@@ -87,7 +107,9 @@ func (s productionStarter) Start(ctx context.Context, cfg configPayload, progres
 		return nil, snapshot{}, fmt.Errorf("bring userspace tailnet up: %w", err)
 	}
 	progress("connecting_host", "")
-	client, err := dialProtocol(ctx, cfg, server.Dial)
+	client, err := retryInitialHostDial(ctx, func() (*protocolClient, error) {
+		return dialProtocol(ctx, cfg, server.Dial)
+	}, waitHostDialRetry)
 	if err != nil {
 		return nil, snapshot{}, fmt.Errorf("%w; %s", err, tailnetEndpointDiagnostic(ctx, server, status, cfg.HostEndpoint))
 	}
@@ -99,6 +121,53 @@ func (s productionStarter) Start(ctx context.Context, cfg configPayload, progres
 	}
 	cleanup = false
 	return ls, snap, nil
+}
+
+func retryInitialHostDial(
+	ctx context.Context,
+	dial func() (*protocolClient, error),
+	wait func(context.Context, time.Duration) error,
+) (*protocolClient, error) {
+	var lastErr error
+	for attempt := 1; attempt <= hostDialMaxAttempts; attempt++ {
+		client, err := dial()
+		if err == nil {
+			return client, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !isTransientInitialHostDial(err) {
+			return nil, err
+		}
+		if attempt == hostDialMaxAttempts {
+			break
+		}
+		if err := wait(ctx, hostDialRetryDelay); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("Host WebSocket unavailable after %d attempts: %w", hostDialMaxAttempts, lastErr)
+}
+
+func isTransientInitialHostDial(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var dialErr *hostDialError
+	return errors.As(err, &dialErr) && dialErr.status == 0
+}
+
+func waitHostDialRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func tailnetEndpointDiagnostic(ctx context.Context, server *tsnet.Server, status *ipnstate.Status, endpoint string) string {
@@ -327,7 +396,7 @@ func dialWebSocket(ctx context.Context, endpoint string, dial func(context.Conte
 				_ = resp.Body.Close()
 			}
 		}
-		return nil, fmt.Errorf("dial Host WebSocket (HTTP %d): %w", status, err)
+		return nil, &hostDialError{status: status, err: err}
 	}
 	if conn.Subprotocol() != WebSocketSubprotocol {
 		_ = conn.Close(websocket.StatusProtocolError, "required subprotocol not negotiated")

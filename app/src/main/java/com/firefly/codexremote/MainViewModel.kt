@@ -1,7 +1,9 @@
 package com.firefly.codexremote
 
 import android.app.Application
+import android.content.pm.PackageManager
 import android.provider.Settings
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.firefly.codexremote.mobilecore.Core
@@ -52,6 +54,8 @@ data class AppUiState(
     val workspaceUploadRecoveryPartial: Boolean = false,
     val userInputDrafts: Map<String, Map<String, UserInputAnswerDraft>> = emptyMap(),
     val submittingRequestIds: Set<String> = emptySet(),
+    val diagnosticMessage: String = "",
+    val diagnosticFailed: Boolean = false,
 )
 
 data class WorkspaceDownloadReady(
@@ -71,6 +75,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val hostPreferences = HostPreferences(application)
     private val _uiState = MutableStateFlow(AppUiState())
     val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
+    private val diagnosticLog = AppDiagnosticLog(File(application.filesDir, "diagnostics/app.log"))
+    private val coreStateDiagnosticRecorder = CoreStateDiagnosticRecorder(diagnosticLog)
 
     private val core: Core = Mobilecore.newCore(
         AndroidPlatformAdapter(application, ::acceptCoreState),
@@ -82,8 +88,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         Settings.Secure.getString(application.contentResolver, Settings.Secure.ANDROID_ID)
             ?: UUID.randomUUID().toString()
         )
+    private val clientVersion = effectiveClientVersion(
+        runCatching {
+            application.packageManager.getPackageInfo(
+                application.packageName,
+                PackageManager.PackageInfoFlags.of(0),
+            ).versionName
+        }.getOrNull(),
+    )
+    private val coreErrorLogger = CoreErrorLogDeduplicator()
 
     init {
+        diagnosticLog.append("app.started", "version=$clientVersion")
         viewModelScope.launch {
             hostPreferences.hostAddress.collect { saved ->
                 _uiState.update { it.copy(hostAddress = saved) }
@@ -106,6 +122,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun connect() {
         val endpoint = uiState.value.hostAddress.trim()
         if (endpoint.isEmpty()) return
+        diagnosticLog.append("core.command", "type=connect")
         viewModelScope.launch(Dispatchers.IO) {
             hostPreferences.setHostAddress(endpoint)
             val payload = JSONObject()
@@ -115,7 +132,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .put("clientId", clientId)
                 .put("clientRunId", UUID.randomUUID().toString())
                 .put("clientName", "codex-remote-android")
-                .put("clientVersion", "0.1.1")
+                .put("clientVersion", clientVersion)
             connectCommands(payload).forEach { command ->
                 acceptCoreState(core.dispatch(command.toString()))
             }
@@ -124,6 +141,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refresh() {
         viewModelScope.launch(Dispatchers.IO) { dispatch("refresh") }
+    }
+
+    fun reportDiagnosticExport(success: Boolean, message: String) {
+        diagnosticLog.append(if (success) "diagnostics.exported" else "diagnostics.export.failed", message)
+        _uiState.update { it.copy(diagnosticMessage = message, diagnosticFailed = !success) }
     }
 
     fun openProjectDialog() {
@@ -645,6 +667,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun dispatch(type: String, payload: JSONObject? = null) {
+        diagnosticLog.append("core.command", "type=$type")
         val command = coreCommand(type, payload)
         acceptCoreState(core.dispatch(command.toString()))
     }
@@ -676,6 +699,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val decoded = runCatching { decodeCoreState(raw) }.getOrElse { error ->
             CoreState(phase = "error", error = "无法解析 MobileCore 状态：${error.message}")
         }
+        coreStateDiagnosticRecorder.record(decoded)
         var listWorkspaceAfterGet: Pair<String, String>? = null
         var refreshWorkspaceDirectory: Pair<String, String>? = null
         var recoverWorkspaceAfterUploadFailure: Pair<String, String>? = null
@@ -804,6 +828,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 next
             }
         }
+        coreErrorLogger.newLogMessage(_uiState.value.core)?.let { message ->
+            Log.e(CoreLogTag, message)
+        }
         projectPathToRemember?.let(::rememberProjectPath)
         listWorkspaceAfterGet?.let { (codexId, directory) ->
             viewModelScope.launch(Dispatchers.IO) {
@@ -838,6 +865,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         core.close()
         super.onCleared()
     }
+}
+
+internal const val CoreLogTag = "CodexRemote"
+
+internal fun effectiveClientVersion(installedVersionName: String?): String =
+    installedVersionName?.trim().orEmpty().ifBlank { "unknown" }
+
+internal class CoreErrorLogDeduplicator {
+    private var wasErrorPhase = false
+    private var lastErrorText = ""
+
+    @Synchronized
+    fun newLogMessage(state: CoreState): String? {
+        val error = state.error.trim()
+        val isErrorPhase = state.phase == "error"
+        val enteredErrorPhase = isErrorPhase && !wasErrorPhase
+        val errorTextChanged = error != lastErrorText
+        wasErrorPhase = isErrorPhase
+        lastErrorText = error
+        if (!enteredErrorPhase && !(errorTextChanged && error.isNotBlank())) return null
+        return if (error.isBlank()) {
+            "MobileCore entered error phase without details"
+        } else {
+            "MobileCore error: ${redactCoreErrorForLog(error)}"
+        }
+    }
+}
+
+internal fun redactCoreErrorForLog(error: String): String {
+    val withoutTailscaleKeys = error.replace(Regex("(?i)tskey-[a-z0-9_-]+"), "[REDACTED]")
+    return withoutTailscaleKeys.replace(
+        Regex("(?i)(auth[_-]?key[\\\"']?\\s*[:=]\\s*[\\\"']?)[^\\s,\\\"'}]+"),
+        "$1[REDACTED]",
+    )
 }
 
 internal fun initialProjectPath(state: AppUiState): String {
