@@ -78,6 +78,70 @@ class CoreStateTest {
     }
 
     @Test
+    fun decodesProtocolHonestyFieldsAndBuildsChineseNotices() {
+        val state = decodeCoreState(
+            """
+            {
+              "codexes":{"codexes":[{
+                "codexId":"C", "title":"T", "cwd":"/w", "status":"IDLE",
+                "origin":"CODEX_ORIGIN_LOCAL_EXISTING", "activeTurnId":"T1",
+                "createdAtUnixMs":10, "importedAtUnixMs":20, "lastActivityAtUnixMs":30,
+                "managedUntilUnixMs":40,
+                "warnings":[{"code":"WARNING_CODE_RUNTIME_RESTARTED","message":"raw","managedUntilUnixMs":41}]
+              }]},
+              "sessionCandidates":{"normalizedCwd":"/w","sessions":[{
+                "sessionId":"S", "cwd":"/w", "createdAtUnixMs":50, "updatedAtUnixMs":60,
+                "warnings":[{"code":"WARNING_CODE_HISTORY_IMPORT_INCOMPLETE","message":"raw"}],
+                "completeness":{"truncated":true,"incomplete":true,"originalSizeBytes":700,"reason":"bounded"}
+              }]},
+              "conversation":{"codexId":"C","turns":[{
+                "turnId":"T1", "status":"completed", "startedAtUnixMs":1, "completedAtUnixMs":2,
+                "completeness":{"incomplete":true,"originalSizeBytes":800,"reason":"gap"},
+                "provenance":"PROVENANCE_KIND_IMPORTED_HISTORY",
+                "items":[{
+                  "itemId":"I", "type":"agent_message", "status":"completed",
+                  "provenance":"PROVENANCE_KIND_HOST_SYNTHESIZED",
+                  "completeness":{"truncated":true,"originalSizeBytes":900},
+                  "agentMessage":{"text":"partial"}
+                }], "messages":[]
+              }]}
+            }
+            """.trimIndent(),
+        )
+
+        val codex = state.codexes.single()
+        assertEquals("CODEX_ORIGIN_LOCAL_EXISTING", codex.origin)
+        assertEquals("T1", codex.activeTurnId)
+        assertEquals(10, codex.createdAtUnixMs)
+        assertEquals(20, codex.importedAtUnixMs)
+        assertEquals(30, codex.lastActivityAtUnixMs)
+        assertEquals(40, codex.managedUntilUnixMs)
+        assertEquals(41, codex.warnings.single().managedUntilUnixMs)
+        assertEquals(listOf("Codex 运行时已重启"), codex.protocolNotices())
+
+        val candidate = state.sessionCandidates!!.sessions.single()
+        assertEquals(50, candidate.createdAtUnixMs)
+        assertEquals(60, candidate.updatedAtUnixMs)
+        assertEquals(700, candidate.completeness!!.originalSizeBytes)
+        assertEquals(listOf("内容已截断且不完整", "历史记录导入不完整"), candidate.protocolNotices())
+
+        val turn = state.conversation!!.turns.single()
+        assertEquals(listOf("内容不完整", "此轮来自导入的历史记录"), turn.protocolNotices())
+        assertEquals(listOf("内容已截断", "由 Host 重建"), turn.items.single().protocolNotices())
+    }
+
+    @Test
+    fun unknownWarningFallsBackWithoutBreakingOlderPayloads() {
+        val state = decodeCoreState(
+            """{"codexes":{"codexes":[{"codexId":"C","warnings":[{"code":"WARNING_CODE_FUTURE","message":"未来提示"},{}]}]}}""",
+        )
+
+        assertEquals(listOf("未来提示", "服务端返回了一条提示"), state.codexes.single().protocolNotices())
+        assertTrue(SessionCandidate().protocolNotices().isEmpty())
+        assertEquals(null, ItemCompleteness().chineseNotice())
+    }
+
+    @Test
     fun managementStateTakesPriorityOverRuntimeStatus() {
         assertEquals("休眠", codexStatusDescription("MANAGEMENT_STATE_UNMANAGED", "RUNNING"))
         assertEquals("即将休眠", codexStatusDescription("EXPIRING_SOON", "IDLE"))

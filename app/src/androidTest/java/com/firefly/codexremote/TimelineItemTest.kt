@@ -198,7 +198,7 @@ class TimelineItemTest {
         )
         compose.setContent {
             MaterialTheme {
-                ConversationHistory(CoreState(conversation = conversation), Modifier.fillMaxSize())
+                ConversationHistory(CoreState(conversation = conversation), "C", Modifier.fillMaxSize())
             }
         }
 
@@ -207,5 +207,94 @@ class TimelineItemTest {
         val secondTop = compose.onNodeWithText("第二轮正文").fetchSemanticsNode().boundsInRoot.top
         assert(firstTop < failureTop) { "失败卡应紧跟第一轮正文" }
         assert(failureTop < secondTop) { "失败卡不应被追加到第二轮之后" }
+    }
+
+    @Test
+    fun conversationHistoryNeverRendersAnotherCodexWhileSelectionLoads() {
+        val oldConversation = ConversationState(
+            codexId = "A",
+            historyComplete = true,
+            turns = listOf(
+                ConversationTurn(
+                    "old-turn", "completed", "", 1, 2,
+                    emptyList(),
+                    listOf(ConversationMessage("old-message", "assistant", "A 的旧消息", "completed")),
+                ),
+            ),
+        )
+        compose.setContent {
+            MaterialTheme {
+                ConversationHistory(
+                    CoreState(phase = "loading_conversation", conversation = oldConversation),
+                    "B",
+                    Modifier.fillMaxSize(),
+                )
+            }
+        }
+
+        compose.onAllNodesWithText("A 的旧消息").assertCountEquals(0)
+        compose.onNodeWithText("正在加载历史记录…").assertIsDisplayed()
+    }
+
+    @Test
+    fun importedHistoryProvenanceIsShownOncePerTurn() {
+        val items = listOf("one", "two").mapIndexed { index, id ->
+            ConversationItem(
+                itemId = id,
+                turnId = "T",
+                type = "agent_message",
+                status = "completed",
+                agentMessage = AgentMessageItem(id),
+                provenance = if (index == 0) {
+                    "PROVENANCE_KIND_IMPORTED_HISTORY"
+                } else {
+                    "PROVENANCE_KIND_HOST_SYNTHESIZED"
+                },
+            )
+        }
+        val conversation = ConversationState(
+            codexId = "C",
+            historyComplete = true,
+            turns = listOf(
+                ConversationTurn(
+                    "T", "completed", "", 1, 2, items, emptyList(),
+                    provenance = "PROVENANCE_KIND_IMPORTED_HISTORY",
+                ),
+            ),
+        )
+        compose.setContent {
+            MaterialTheme {
+                ConversationHistory(CoreState(conversation = conversation), "C", Modifier.fillMaxSize())
+            }
+        }
+
+        compose.onAllNodesWithText("此轮来自导入的历史记录").assertCountEquals(1)
+        compose.onAllNodesWithText("来自导入的历史记录").assertCountEquals(0)
+        compose.onAllNodesWithText("由 Host 重建").assertCountEquals(1)
+    }
+
+    @Test
+    fun collapsedProcessGroupStillShowsCompletenessNotice() {
+        val command = ConversationItem(
+            itemId = "command-incomplete",
+            turnId = "T",
+            type = "command",
+            status = "completed",
+            completeness = ItemCompleteness(truncated = true),
+            command = CommandItem(listOf("make", "test"), "/work", "hidden output", true, 0),
+        )
+        val conversation = ConversationState(
+            codexId = "C",
+            historyComplete = true,
+            turns = listOf(ConversationTurn("T", "completed", "", 1, 2, listOf(command), emptyList())),
+        )
+        compose.setContent {
+            MaterialTheme {
+                ConversationHistory(CoreState(conversation = conversation), "C", Modifier.fillMaxSize())
+            }
+        }
+
+        compose.onNodeWithText("内容已截断").assertIsDisplayed()
+        compose.onAllNodesWithText("hidden output").assertCountEquals(0)
     }
 }

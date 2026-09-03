@@ -2,6 +2,7 @@ package com.firefly.codexremote
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -12,7 +13,9 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
+import androidx.compose.ui.test.swipeUp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -107,6 +110,44 @@ class WorkspaceUiTest {
 
         compose.onNodeWithTag("workspace-save").assertIsEnabled().performClick()
         assertEquals(1, saves)
+    }
+
+    @Test
+    fun longEditorScrollKeepsLineNumbersAndTextLockedTogether() {
+        val content = (1..140).joinToString("\n") { "line $it" }
+        val entry = WorkspaceEntry(
+            "long.txt", "long.txt", "regular_file", sizeBytes = content.length.toLong(),
+            revision = "r1", textViewable = true, textEditable = true,
+        )
+        val workspace = WorkspaceState(
+            supported = true,
+            accessState = WorkspaceAccessState(mutationStatus = "allowed", quiescenceToken = "q"),
+            currentDirectory = WorkspaceDirectory(),
+            openFile = WorkspaceOpenFile(entry, content),
+        )
+        compose.setContent {
+            MaterialTheme {
+                WorkspaceScreen(
+                    AppUiState(core = CoreState(workspace = workspace), workspaceEditorOpen = true, workspaceEditorText = content),
+                    onListWorkspace = {}, onOpenFile = {}, onEditorChanged = {}, onSave = {}, onCloseEditor = {},
+                )
+            }
+        }
+
+        val lineNumbers = compose.onNodeWithTag("workspace-line-numbers")
+        val editor = compose.onNodeWithTag("workspace-editor")
+        val beforeNumbers = lineNumbers.fetchSemanticsNode().boundsInRoot.top
+        val beforeEditor = editor.fetchSemanticsNode().boundsInRoot.top
+        repeat(8) { compose.onNodeWithTag("workspace-editor-scroll").performTouchInput { swipeUp() } }
+        val numberNode = lineNumbers.fetchSemanticsNode()
+        val editorNode = editor.fetchSemanticsNode()
+        val renderedNumbers = numberNode.config[SemanticsProperties.Text].joinToString { it.text }
+        val renderedText = editorNode.config[SemanticsProperties.EditableText].text
+
+        assertEquals(beforeNumbers - numberNode.boundsInRoot.top, beforeEditor - editorNode.boundsInRoot.top, 1f)
+        assertTrue(numberNode.boundsInRoot.top < beforeNumbers)
+        assertTrue(renderedNumbers.contains("140"))
+        assertTrue(renderedText.contains("line 140"))
     }
 
     @Test

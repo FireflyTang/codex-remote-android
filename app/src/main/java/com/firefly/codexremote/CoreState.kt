@@ -8,6 +8,19 @@ data class CodexSummary(
     val cwd: String,
     val status: String,
     val managementState: String = "",
+    val origin: String = "",
+    val activeTurnId: String = "",
+    val createdAtUnixMs: Long = 0,
+    val importedAtUnixMs: Long = 0,
+    val lastActivityAtUnixMs: Long = 0,
+    val managedUntilUnixMs: Long = 0,
+    val warnings: List<ProtocolWarning> = emptyList(),
+)
+
+data class ProtocolWarning(
+    val code: String = "",
+    val message: String = "",
+    val managedUntilUnixMs: Long = 0,
 )
 
 data class DirectoryEntry(val name: String = "", val path: String = "")
@@ -24,6 +37,10 @@ data class SessionCandidate(
     val source: String = "",
     val availability: String = "",
     val managedCodexId: String = "",
+    val createdAtUnixMs: Long = 0,
+    val updatedAtUnixMs: Long = 0,
+    val warnings: List<ProtocolWarning> = emptyList(),
+    val completeness: ItemCompleteness? = null,
 )
 
 data class SessionCandidates(
@@ -150,6 +167,7 @@ data class ConversationItem(
     val command: CommandItem? = null,
     val tool: ToolItem? = null,
     val fileChange: FileChangeItem? = null,
+    val provenance: String = "",
 )
 
 data class ConversationTurn(
@@ -160,6 +178,8 @@ data class ConversationTurn(
     val completedAtUnixMs: Long,
     val items: List<ConversationItem>,
     val messages: List<ConversationMessage>,
+    val completeness: ItemCompleteness? = null,
+    val provenance: String = "",
 )
 
 data class PendingError(
@@ -303,8 +323,12 @@ fun decodeCoreState(raw: String): CoreState {
                             title = session.optString("title"),
                             preview = session.optString("preview"),
                             source = session.optString("source"),
+                            createdAtUnixMs = session.optLong("createdAtUnixMs"),
+                            updatedAtUnixMs = session.optLong("updatedAtUnixMs"),
                             availability = session.optString("availability"),
                             managedCodexId = session.optString("managedCodexId"),
+                            warnings = decodeProtocolWarnings(session.optJSONArray("warnings")),
+                            completeness = decodeCompleteness(session.optJSONObject("completeness")),
                         ),
                     )
                 }
@@ -331,6 +355,8 @@ fun decodeCoreState(raw: String): CoreState {
                             failure = turn.optString("failure"),
                             startedAtUnixMs = turn.optLong("startedAtUnixMs"),
                             completedAtUnixMs = turn.optLong("completedAtUnixMs"),
+                            completeness = decodeCompleteness(turn.optJSONObject("completeness")),
+                            provenance = turn.optString("provenance"),
                             items = buildList {
                                 if (items != null) repeat(items.length()) { itemIndex ->
                                     val item = items.optJSONObject(itemIndex) ?: return@repeat
@@ -391,6 +417,13 @@ fun decodeCoreState(raw: String): CoreState {
                             cwd = item.optString("cwd"),
                             status = item.optString("status"),
                             managementState = item.optString("managementState"),
+                            origin = item.optString("origin"),
+                            activeTurnId = item.optString("activeTurnId"),
+                            createdAtUnixMs = item.optLong("createdAtUnixMs"),
+                            importedAtUnixMs = item.optLong("importedAtUnixMs"),
+                            lastActivityAtUnixMs = item.optLong("lastActivityAtUnixMs"),
+                            managedUntilUnixMs = item.optLong("managedUntilUnixMs"),
+                            warnings = decodeProtocolWarnings(item.optJSONArray("warnings")),
                         ),
                     )
                 }
@@ -549,14 +582,7 @@ private fun decodeWorkspaceEntry(value: JSONObject) = WorkspaceEntry(
 )
 
 private fun decodeConversationItem(item: JSONObject): ConversationItem {
-    val completeness = item.optJSONObject("completeness")?.let {
-        ItemCompleteness(
-            truncated = it.optBoolean("truncated"),
-            incomplete = it.optBoolean("incomplete"),
-            originalSizeBytes = it.optLong("originalSizeBytes"),
-            reason = it.optString("reason"),
-        )
-    }
+    val completeness = decodeCompleteness(item.optJSONObject("completeness"))
     val user = item.optJSONObject("userMessage")?.let {
         val parts = it.optJSONArray("textParts")
         UserMessageItem(
@@ -615,6 +641,7 @@ private fun decodeConversationItem(item: JSONObject): ConversationItem {
         type = item.optString("type", "unknown"),
         status = item.optString("status", "unspecified"),
         completeness = completeness,
+        provenance = item.optString("provenance"),
         userMessage = user,
         agentMessage = item.optJSONObject("agentMessage")?.let { AgentMessageItem(it.optString("text")) },
         reasoningSummary = item.optJSONObject("reasoningSummary")?.let { ReasoningSummaryItem(it.optString("text")) },
@@ -626,3 +653,60 @@ private fun decodeConversationItem(item: JSONObject): ConversationItem {
         fileChange = fileChange,
     )
 }
+
+private fun decodeProtocolWarnings(values: org.json.JSONArray?) = buildList {
+    if (values != null) repeat(values.length()) { index ->
+        val warning = values.optJSONObject(index) ?: return@repeat
+        add(
+            ProtocolWarning(
+                code = warning.optString("code"),
+                message = warning.optString("message"),
+                managedUntilUnixMs = warning.optLong("managedUntilUnixMs"),
+            ),
+        )
+    }
+}
+
+private fun decodeCompleteness(value: JSONObject?) = value?.let {
+    ItemCompleteness(
+        truncated = it.optBoolean("truncated"),
+        incomplete = it.optBoolean("incomplete"),
+        originalSizeBytes = it.optLong("originalSizeBytes"),
+        reason = it.optString("reason"),
+    )
+}
+
+internal fun ProtocolWarning.chineseNotice(): String = when (code.uppercase()) {
+    "WARNING_CODE_LIVE_SESSION_CONCURRENCY_RISK", "LIVE_SESSION_CONCURRENCY_RISK" -> "此会话可能正在其他位置使用"
+    "WARNING_CODE_HISTORY_IMPORT_INCOMPLETE", "HISTORY_IMPORT_INCOMPLETE" -> "历史记录导入不完整"
+    "WARNING_CODE_AUDIT_DEGRADED", "AUDIT_DEGRADED" -> "审计信息不完整"
+    "WARNING_CODE_RUNTIME_RESTARTED", "RUNTIME_RESTARTED" -> "Codex 运行时已重启"
+    "WARNING_CODE_MANAGEMENT_EXPIRING_SOON", "MANAGEMENT_EXPIRING_SOON" -> "此会话即将休眠"
+    else -> message.ifBlank { "服务端返回了一条提示" }
+}
+
+internal fun ItemCompleteness.chineseNotice(): String? = when {
+    truncated && incomplete -> "内容已截断且不完整"
+    truncated -> "内容已截断"
+    incomplete -> "内容不完整"
+    else -> null
+}
+
+internal fun SessionCandidate.protocolNotices(): List<String> = buildList {
+    completeness?.chineseNotice()?.let(::add)
+    warnings.mapTo(this) { it.chineseNotice() }
+}.distinct()
+
+internal fun CodexSummary.protocolNotices(): List<String> = warnings.map { it.chineseNotice() }.distinct()
+
+internal fun ConversationTurn.protocolNotices(): List<String> = buildList {
+    completeness?.chineseNotice()?.let(::add)
+    if (provenance.equals("PROVENANCE_KIND_IMPORTED_HISTORY", ignoreCase = true)) add("此轮来自导入的历史记录")
+    if (provenance.equals("PROVENANCE_KIND_HOST_SYNTHESIZED", ignoreCase = true)) add("此轮由 Host 重建")
+}.distinct()
+
+internal fun ConversationItem.protocolNotices(): List<String> = buildList {
+    completeness?.chineseNotice()?.let(::add)
+    if (provenance.equals("PROVENANCE_KIND_IMPORTED_HISTORY", ignoreCase = true)) add("来自导入的历史记录")
+    if (provenance.equals("PROVENANCE_KIND_HOST_SYNTHESIZED", ignoreCase = true)) add("由 Host 重建")
+}.distinct()

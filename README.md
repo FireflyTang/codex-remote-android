@@ -25,16 +25,25 @@
 
 ## 验证范围
 
-真机已验证内嵌 Tailnet 连接真实 Host、加载会话历史、`StartTurn` 和
-`InterruptTurn`。rich timeline、workspace、pending request 和 SAF 传输是后续增加的
-功能，当前仅通过 JVM 单测和 API 36 模拟器验收，不表示它们已在真机上全部联调。
+最近一次完整自动化基线为：MobileCore Go 全量与 `-race` 通过、JVM 108/108、
+API 36 x86_64 模拟器 connected suite 45/45。模拟器覆盖连接与错误状态、项目目录和
+session 可用性、会话管理、rich timeline、pending request、workspace/SAF 边界、
+诊断导出以及前台恢复状态流。
 
-最近一次 API 36 x86_64 模拟器全量 connected suite 为 25/25 通过。当前官方
-API 36 x86_64 16 KB system image 不可用，实际 guest page size 为 4096 bytes；
+应用离开前台至少 10 秒后再次回到前台时，会在当前状态允许的情况下，使用已保存的
+Host 地址单次重启连接，并恢复原来打开的会话。运行中的回合、待审批/用户输入和正在
+执行的 UI 操作不会被打断。这里没有后台定时器或循环重连，也不代表应用能在后台长驻。
+
+真机已验证内嵌 Tailnet 连接真实 Host、加载会话历史、`StartTurn`、`InterruptTurn`
+以及 arm64 native 库加载。rich timeline、workspace、pending request、SAF 传输、
+前台恢复等后续功能尚未全部在真机联调；模拟器结果不等同于 OriginOS 设备行为。
+
+当前官方 API 36 x86_64 16 KB system image 不可用，实际 guest page size 为 4096 bytes；
 APK 中 arm64 native ELF 的 `LOAD` segment 对齐为 `0x4000`，且该 native 库已在真机成功加载。
 这些证据不等同于 16 KB guest 模拟器验证。
 
-后台长驻、锁屏/冻结、省电策略和 Clash VPN 兼容性明确冻结，不纳入第一版验收。
+尚未验证或宣称支持 OriginOS 长期锁屏、冻结、省电策略下的后台保活，也未完成 Clash
+开启状态下的真机专项联调。
 
 ## 下载 APK
 

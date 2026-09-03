@@ -3,6 +3,7 @@ package com.firefly.codexremote
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -45,8 +46,11 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -54,6 +58,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,6 +70,16 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
+
+    override fun onStart() {
+        super.onStart()
+        viewModel.onActivityStarted(SystemClock.elapsedRealtime())
+    }
+
+    override fun onStop() {
+        viewModel.onActivityStopped(SystemClock.elapsedRealtime(), isChangingConfigurations)
+        super.onStop()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -177,6 +192,7 @@ class MainActivity : ComponentActivity() {
                     viewModel::openProjectDialog, viewModel::closeProjectDialog,
                     viewModel::setProjectPath, viewModel::listDirectories,
                     viewModel::listSessionCandidates, viewModel::createCodex,
+                    viewModel::confirmCreateMissingDirectory, viewModel::cancelCreateMissingDirectory,
                     viewModel::importSession, viewModel::renameCodex,
                     viewModel::unmanageCodex, viewModel::forgetCodex,
                     viewModel::showConversationPage, viewModel::showWorkspacePage,
@@ -255,6 +271,8 @@ fun CodexRemoteScreen(
     onListDirectories: (String) -> Unit = {},
     onListSessionCandidates: () -> Unit = {},
     onCreateCodex: () -> Unit = {},
+    onConfirmCreateMissingDirectory: () -> Unit = {},
+    onCancelCreateMissingDirectory: () -> Unit = {},
     onImportSession: (String, String) -> Unit = { _, _ -> },
     onRenameCodex: (String, String) -> Unit = { _, _ -> },
     onUnmanageCodex: (String) -> Unit = {},
@@ -275,15 +293,22 @@ fun CodexRemoteScreen(
     onExportDiagnostics: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    val displayState = when {
+        state.foregroundRecoveryInProgress ->
+            state.copy(core = state.core.copy(phase = "recovering_foreground", error = ""))
+        state.foregroundRecoveryError.isNotBlank() ->
+            state.copy(core = state.core.copy(error = state.foregroundRecoveryError))
+        else -> state
+    }
     Surface(
         modifier.fillMaxSize().semantics { testTagsAsResourceId = true },
         color = CodexColors.Graphite,
     ) {
-        if (state.openCodexId != null) {
-            BackHandler(onBack = if (state.conversationPage == ConversationPage.WORKSPACE) onShowConversation else onCloseConversation)
+        if (displayState.openCodexId != null) {
+            BackHandler(onBack = if (displayState.conversationPage == ConversationPage.WORKSPACE) onShowConversation else onCloseConversation)
             ConversationScreen(
-                state.core.codexes.find { it.id == state.openCodexId }?.title.orEmpty().ifBlank { "Codex 会话" },
-                state, onDraftChanged, onSend, onStop, onCloseConversation,
+                displayState.core.codexes.find { it.id == displayState.openCodexId }?.title.orEmpty().ifBlank { "Codex 会话" },
+                displayState, onDraftChanged, onSend, onStop, onCloseConversation,
                 onShowConversation, onShowWorkspace, onListWorkspace, onOpenWorkspaceFile,
                 onWorkspaceEditorChanged, onSaveWorkspaceFile, onCloseWorkspaceEditor,
                 onChooseWorkspaceUpload, onChooseWorkspaceDownload,
@@ -292,14 +317,32 @@ fun CodexRemoteScreen(
             )
         } else {
             HomeScreen(
-                state, onHostAddressChanged, onConnect, onRefresh, onOpenAuth, onOpenConversation,
+                displayState, onHostAddressChanged, onConnect, onRefresh, onOpenAuth, onOpenConversation,
                 onOpenProject, onRenameCodex, onUnmanageCodex, onForgetCodex,
                 onExportDiagnostics,
             )
-            if (state.projectDialogOpen) {
+            if (displayState.projectDialogOpen) {
                 ProjectDialog(
-                    state, onCloseProject, onProjectPathChanged, onListDirectories,
+                    displayState, onCloseProject, onProjectPathChanged, onListDirectories,
                     onListSessionCandidates, onCreateCodex, onImportSession, onOpenConversation,
+                )
+            }
+            if (displayState.missingDirectoryConfirmationPath.isNotBlank()) {
+                AlertDialog(
+                    onDismissRequest = onCancelCreateMissingDirectory,
+                    modifier = Modifier.testTag("confirm-create-directory"),
+                    title = { Text("创建目录？") },
+                    text = {
+                        Text("目录不存在：\n${displayState.missingDirectoryConfirmationPath}\n\n是否创建该目录并新建项目？")
+                    },
+                    confirmButton = {
+                        TextButton(onConfirmCreateMissingDirectory, modifier = Modifier.testTag("confirm-create-directory-action")) {
+                            Text("创建并继续")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onCancelCreateMissingDirectory) { Text("取消") }
+                    },
                 )
             }
         }
@@ -466,7 +509,7 @@ internal fun CodexList(
                 Modifier.fillMaxWidth().testTag("codex-item-${codex.id}")
                     .semantics { contentDescription = "打开会话：$title" }
                     .clip(MaterialTheme.shapes.medium)
-                    .clickable { onOpenConversation(codex.id) }
+                    .clickable(enabled = core.phase == "ready") { onOpenConversation(codex.id) }
                     .border(1.dp, CodexColors.Border, MaterialTheme.shapes.medium),
                 color = CodexColors.Charcoal,
                 shape = MaterialTheme.shapes.medium,
@@ -506,6 +549,9 @@ internal fun CodexList(
                     codexStatusDescription(codex.managementState, codex.status).takeIf { it.isNotBlank() }?.let {
                         Text(it, style = MaterialTheme.typography.labelMedium)
                     }
+                    codexUiProtocolNotices(codex).takeIf { it.isNotEmpty() }?.let {
+                        ProtocolNoticeText(it, "codex-notice-${codex.id}")
+                    }
                 }
             }
             if (renameOpen) {
@@ -538,9 +584,42 @@ internal fun ProjectDialog(
     onOpenManaged: (String) -> Unit,
 ) {
     val core = state.core
-    val busy = core.phase in ProjectBusyPhases || state.pendingProjectCommandId.isNotBlank()
+    val candidates = visibleProjectSessionCandidates(state)
+    var showingCandidates by rememberSaveable(state.projectDialogOpen) {
+        mutableStateOf(candidates != null || state.pendingSessionCandidatesCommandId.isNotBlank())
+    }
+    val busy = state.pendingDirectoryCommandId.isNotBlank() ||
+        state.pendingSessionCandidatesCommandId.isNotBlank() ||
+        state.pendingProjectCommandId.isNotBlank()
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val density = LocalDensity.current
+    val imeVisible = WindowInsets.ime.getBottom(density) > 0
+    val clearInputFocus = {
+        focusManager.clearFocus(force = true)
+        keyboardController?.hide()
+    }
+    val runProjectAction: (() -> Unit) -> Unit = { action ->
+        clearInputFocus()
+        action()
+    }
+    LaunchedEffect(candidates, state.pendingSessionCandidatesCommandId) {
+        if (candidates != null || state.pendingSessionCandidatesCommandId.isNotBlank()) {
+            showingCandidates = true
+        }
+    }
+    val dismissOrHideInput = {
+        when {
+            imeVisible -> clearInputFocus()
+            !busy -> onDismiss()
+        }
+    }
+    LaunchedEffect(Unit) { clearInputFocus() }
+    BackHandler(onBack = dismissOrHideInput)
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = dismissOrHideInput,
+        modifier = Modifier.testTag("project-dialog").windowInsetsPadding(WindowInsets.ime),
+        properties = DialogProperties(dismissOnBackPress = false),
         containerColor = CodexColors.Charcoal,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -550,55 +629,134 @@ internal fun ProjectDialog(
         },
         text = {
             Column(
-                Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                Modifier.fillMaxWidth().heightIn(min = 440.dp, max = 560.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 OutlinedTextField(
-                    state.projectPath, onPathChanged, Modifier.fillMaxWidth().testTag("project-path"),
+                    state.projectPath,
+                    {
+                        showingCandidates = false
+                        onPathChanged(it)
+                    },
+                    Modifier.fillMaxWidth().testTag("project-path"),
                     label = { Text("当前路径") },
-                    leadingIcon = { Icon(Icons.Rounded.Folder, null) }, singleLine = true,
+                    leadingIcon = { Icon(Icons.Rounded.Folder, null) }, singleLine = true, enabled = !busy,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
-                        { parentProjectPath(state.projectPath)?.let(onListDirectories) },
+                        {
+                            parentProjectPath(state.projectPath)?.let { path ->
+                                runProjectAction {
+                                    showingCandidates = false
+                                    onListDirectories(path)
+                                }
+                            }
+                        },
                         enabled = !busy && parentProjectPath(state.projectPath) != null,
                     ) { Icon(Icons.Rounded.ArrowUpward, null); Spacer(Modifier.width(6.dp)); Text("上一级") }
                     OutlinedButton(
-                        { onListDirectories(state.projectPath) },
+                        {
+                            runProjectAction {
+                                showingCandidates = false
+                                onListDirectories(state.projectPath)
+                            }
+                        },
                         enabled = !busy && state.projectPath.isNotBlank(),
                     ) { Icon(Icons.Rounded.Search, null); Spacer(Modifier.width(6.dp)); Text("浏览") }
                 }
-                if (core.phase == "loading_directories") LinearProgressIndicator(Modifier.fillMaxWidth())
-                core.directoryListing?.directories.orEmpty().forEach { directory ->
-                    TextButton(
-                        { onListDirectories(directory.path) },
-                        Modifier.fillMaxWidth().testTag("project-directory-${directory.name}"),
-                    ) {
-                        Icon(Icons.Rounded.Folder, null, tint = CodexColors.Indigo)
-                        Spacer(Modifier.width(10.dp))
-                        Text(directory.name.ifBlank { directory.path }, Modifier.fillMaxWidth())
-                    }
-                }
-                HorizontalDivider()
                 Button(
-                    onListCandidates,
+                    {
+                        runProjectAction {
+                            showingCandidates = true
+                            onListCandidates()
+                        }
+                    },
                     Modifier.fillMaxWidth().testTag("list-session-candidates"),
                     enabled = !busy && state.projectPath.isNotBlank(),
                 ) { Icon(Icons.Rounded.History, null); Spacer(Modifier.width(8.dp)); Text("查看此目录下可导入会话") }
-                if (core.phase == "loading_session_candidates") LinearProgressIndicator(Modifier.fillMaxWidth())
-                core.sessionCandidates?.sessions.orEmpty().forEach { candidate ->
-                    SessionCandidateRow(candidate, busy, onImport, onOpenManaged)
-                }
-                if (core.error.isNotBlank()) Text(core.error, color = MaterialTheme.colorScheme.error)
                 Button(
-                    onCreate,
+                    { runProjectAction(onCreate) },
                     Modifier.fillMaxWidth().testTag("create-codex"),
                     enabled = !busy && state.projectPath.isNotBlank(),
                 ) { Icon(Icons.Rounded.Add, null); Spacer(Modifier.width(8.dp)); Text(if (core.phase == "creating_codex") "新建中…" else "新建此项目") }
+                HorizontalDivider()
+                LazyColumn(
+                    Modifier.fillMaxWidth().weight(1f).testTag("project-results"),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (showingCandidates) {
+                        item {
+                            TextButton(
+                                {
+                                    runProjectAction { showingCandidates = false }
+                                },
+                                Modifier.fillMaxWidth().testTag("return-directory-browser"),
+                                enabled = !busy,
+                            ) {
+                                Icon(Icons.AutoMirrored.Outlined.ArrowBack, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("返回目录浏览", Modifier.fillMaxWidth())
+                            }
+                        }
+                        if (core.phase == "loading_session_candidates") {
+                            item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                        }
+                        if (core.phase != "loading_session_candidates" && candidates != null && candidates.sessions.isEmpty()) {
+                            item {
+                                Text(
+                                    "此目录下没有可导入的会话",
+                                    Modifier.fillMaxWidth().padding(vertical = 18.dp).testTag("empty-session-candidates"),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        itemsIndexed(
+                            candidates?.sessions.orEmpty(),
+                            key = { _, candidate -> candidate.sessionId },
+                        ) { _, candidate ->
+                            SessionCandidateRow(
+                                candidate,
+                                busy,
+                                { sessionId, source -> runProjectAction { onImport(sessionId, source) } },
+                                { codexId -> runProjectAction { onOpenManaged(codexId) } },
+                            )
+                        }
+                    } else {
+                        if (core.phase == "loading_directories") {
+                            item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                        }
+                        itemsIndexed(
+                            core.directoryListing?.directories.orEmpty(),
+                            key = { _, directory -> directory.path },
+                        ) { _, directory ->
+                            TextButton(
+                                {
+                                    runProjectAction {
+                                        showingCandidates = false
+                                        onListDirectories(directory.path)
+                                    }
+                                },
+                                Modifier.fillMaxWidth().testTag("project-directory-${directory.name}"),
+                                enabled = !busy,
+                            ) {
+                                Icon(Icons.Rounded.Folder, null, tint = CodexColors.Indigo)
+                                Spacer(Modifier.width(10.dp))
+                                Text(directory.name.ifBlank { directory.path }, Modifier.fillMaxWidth())
+                            }
+                        }
+                    }
+                    state.projectError.takeIf { it.isNotBlank() }?.let { error ->
+                        item {
+                            Text(error, Modifier.testTag("project-error"), color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
             }
         },
         confirmButton = {},
-        dismissButton = { TextButton(onDismiss, enabled = !busy) { Text("关闭") } },
+        dismissButton = {
+            TextButton({ runProjectAction(onDismiss) }, enabled = !busy) { Text("关闭") }
+        },
     )
 }
 
@@ -609,9 +767,8 @@ private fun SessionCandidateRow(
     onImport: (String, String) -> Unit,
     onOpenManaged: (String) -> Unit,
 ) {
-    val resumable = candidate.availability.uppercase().endsWith("RESUMABLE") ||
-        candidate.availability.uppercase().endsWith("AVAILABLE")
-    val managed = candidate.availability.uppercase().endsWith("ALREADY_MANAGED") || candidate.managedCodexId.isNotBlank()
+    val resumable = isResumableSessionAvailability(candidate.availability)
+    val managed = isManagedSessionAvailability(candidate.availability) || candidate.managedCodexId.isNotBlank()
     val action = when {
         managed -> { -> if (candidate.managedCodexId.isNotBlank()) onOpenManaged(candidate.managedCodexId) }
         resumable -> { -> onImport(candidate.sessionId, candidate.source) }
@@ -627,6 +784,9 @@ private fun SessionCandidateRow(
             Text(candidate.title.ifBlank { candidate.sessionId.ifBlank { "未命名会话" } }, fontWeight = FontWeight.Medium)
             if (candidate.preview.isNotBlank()) Text(candidate.preview, style = MaterialTheme.typography.bodySmall, maxLines = 2)
             Text(sessionAvailabilityDescription(candidate.availability, managed), style = MaterialTheme.typography.labelMedium)
+            candidate.protocolNotices().takeIf { it.isNotEmpty() }?.let {
+                ProtocolNoticeText(it, "session-notice-${candidate.sessionId}")
+            }
         }
     }
 }
@@ -693,8 +853,21 @@ private fun ConversationScreen(
             Column(Modifier.weight(1f)) {
                 Text(title, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Surface(Modifier.size(7.dp), CircleShape, color = if (core.error.isBlank()) CodexColors.Green else CodexColors.Error) {}
-                    Text(if (core.error.isBlank()) "已连接" else "连接异常", style = MaterialTheme.typography.labelMedium, color = if (core.error.isBlank()) CodexColors.Green else CodexColors.Error)
+                    val statusColor = when {
+                        state.foregroundRecoveryInProgress -> CodexColors.Indigo
+                        core.error.isBlank() -> CodexColors.Green
+                        else -> CodexColors.Error
+                    }
+                    Surface(Modifier.size(7.dp), CircleShape, color = statusColor) {}
+                    Text(
+                        when {
+                            state.foregroundRecoveryInProgress -> "正在恢复连接"
+                            core.error.isBlank() -> "已连接"
+                            else -> "连接异常"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = statusColor,
+                    )
                 }
             }
             IconButton(
@@ -736,7 +909,7 @@ private fun ConversationScreen(
                         style = MaterialTheme.typography.labelMedium,
                     )
                 }
-                ConversationHistory(core, Modifier.weight(1f).fillMaxWidth())
+                ConversationHistory(core, state.openCodexId, Modifier.weight(1f).fillMaxWidth())
                 PendingRequestsPanel(
                     conversation = conversation,
                     drafts = state.userInputDrafts,
@@ -1168,6 +1341,10 @@ private fun WorkspaceEditorDialog(
 ) {
     val entry = workspace.openFile?.entry ?: return
     val saveAllowed = canSaveWorkspaceFile(entry, workspace.accessState) && workspace.loading != "write"
+    val editorScrollState = rememberScrollState()
+    val lineNumbers = remember(state.workspaceEditorText) {
+        state.workspaceEditorText.lines().indices.joinToString("\n") { (it + 1).toString() }
+    }
     AlertDialog(
         onDismissRequest = onClose,
         modifier = Modifier.testTag("workspace-editor-dialog"),
@@ -1175,19 +1352,28 @@ private fun WorkspaceEditorDialog(
         title = { Text(entry.name.ifBlank { entry.relativePath }) },
         text = {
             Column(Modifier.fillMaxWidth().heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(Modifier.fillMaxWidth().weight(1f)) {
+                Row(
+                    Modifier.fillMaxWidth().weight(1f)
+                        .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.extraSmall)
+                        .padding(horizontal = 12.dp).verticalScroll(editorScrollState)
+                        .testTag("workspace-editor-scroll"),
+                ) {
                     Text(
-                        state.workspaceEditorText.lines().indices.joinToString("\n") { (it + 1).toString() },
-                        Modifier.padding(top = 16.dp, end = 8.dp),
+                        lineNumbers,
+                        Modifier.padding(top = 12.dp, end = 8.dp).testTag("workspace-line-numbers"),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    OutlinedTextField(
-                        state.workspaceEditorText,
-                        onEditorChanged,
-                        Modifier.weight(1f).fillMaxHeight().testTag("workspace-editor"),
+                    BasicTextField(
+                        value = state.workspaceEditorText,
+                        onValueChange = onEditorChanged,
+                        modifier = Modifier.weight(1f).padding(vertical = 12.dp).testTag("workspace-editor"),
                         enabled = entry.textEditable,
-                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        textStyle = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        ),
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                     )
                 }
                 if (!saveAllowed) Text(workspaceSaveUnavailableReason(entry, workspace.accessState), style = MaterialTheme.typography.labelSmall)
@@ -1216,13 +1402,13 @@ internal fun workspaceSaveUnavailableReason(entry: WorkspaceEntry, access: Works
 }
 
 @Composable
-internal fun ConversationHistory(core: CoreState, modifier: Modifier = Modifier) {
-    val conversation = core.conversation
+internal fun ConversationHistory(core: CoreState, openCodexId: String?, modifier: Modifier = Modifier) {
+    val conversation = core.conversation?.takeIf { it.codexId == openCodexId }
     Box(
         modifier.testTag("conversation-history").semantics { contentDescription = "会话历史" },
     ) {
         when {
-            core.phase == "loading_conversation" && conversation == null ->
+            openCodexId != null && conversation == null ->
                 Text("正在加载历史记录…", Modifier.align(Alignment.Center))
             conversation?.timelineEntries.isNullOrEmpty() ->
                 Text("还没有消息", Modifier.align(Alignment.Center), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1247,23 +1433,27 @@ internal fun ConversationHistory(core: CoreState, modifier: Modifier = Modifier)
                     val entryTurnId = entry.timelineTurnId()
                     val nextTurnId = displayEntries.getOrNull(chronologicalIndex + 1)?.timelineTurnId()
                     val connectBelow = entryTurnId.isNotBlank() && entryTurnId == nextTurnId
-                    when (entry) {
-                        is TimelineDisplayEntry.Message -> {
-                            val turn = turnsById[entry.item.turnId]
-                            val timestamp = when (entry.item.type) {
-                                "agent_message" -> turn?.completedAtUnixMs?.takeIf { it > 0 }
-                                    ?: turn?.startedAtUnixMs
-                                else -> turn?.startedAtUnixMs
-                            }?.takeIf { it > 0 }?.let(::formatTimelineTime).orEmpty()
-                            TimelineItem(entry.item, timestamp, connectBelow)
+                    val previousTurnId = displayEntries.getOrNull(chronologicalIndex - 1)?.timelineTurnId()
+                    val turn = turnsById[entryTurnId]
+                    val notices = timelineUiProtocolNotices(entry, turn, entryTurnId != previousTurnId)
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        if (notices.isNotEmpty()) ProtocolNoticeText(notices, "timeline-notice-${entry.key}")
+                        when (entry) {
+                            is TimelineDisplayEntry.Message -> {
+                                val timestamp = when (entry.item.type) {
+                                    "agent_message" -> turn?.completedAtUnixMs?.takeIf { it > 0 }
+                                        ?: turn?.startedAtUnixMs
+                                    else -> turn?.startedAtUnixMs
+                                }?.takeIf { it > 0 }?.let(::formatTimelineTime).orEmpty()
+                                TimelineItem(entry.item, timestamp, connectBelow)
+                            }
+                            is TimelineDisplayEntry.ProcessGroup -> {
+                                val timestamp = turn?.startedAtUnixMs?.takeIf { it > 0 }
+                                    ?.let(::formatTimelineTime).orEmpty()
+                                ProcessGroupCard(entry.items, timestamp, connectBelow)
+                            }
+                            is TimelineDisplayEntry.TurnFailure -> TurnFailureCard(entry.failure)
                         }
-                        is TimelineDisplayEntry.ProcessGroup -> {
-                            val turn = turnsById[entry.turnId]
-                            val timestamp = turn?.startedAtUnixMs?.takeIf { it > 0 }
-                                ?.let(::formatTimelineTime).orEmpty()
-                            ProcessGroupCard(entry.items, timestamp, connectBelow)
-                        }
-                        is TimelineDisplayEntry.TurnFailure -> TurnFailureCard(entry.failure)
                     }
                 }
             }
@@ -1275,6 +1465,43 @@ private fun TimelineDisplayEntry.timelineTurnId(): String = when (this) {
     is TimelineDisplayEntry.Message -> item.turnId
     is TimelineDisplayEntry.ProcessGroup -> turnId
     is TimelineDisplayEntry.TurnFailure -> turnId
+}
+
+@Composable
+private fun ProtocolNoticeText(notices: List<String>, tag: String) {
+    Text(
+        notices.joinToString(" · "),
+        Modifier.testTag(tag),
+        color = MaterialTheme.colorScheme.tertiary,
+        style = MaterialTheme.typography.labelSmall,
+    )
+}
+
+internal fun codexUiProtocolNotices(codex: CodexSummary): List<String> {
+    val sleeping = codexStatusDescription(codex.managementState, codex.status) == "休眠"
+    return codex.protocolNotices().filterNot { sleeping && it == "此会话即将休眠" }
+}
+
+internal fun timelineUiProtocolNotices(
+    entry: TimelineDisplayEntry,
+    turn: ConversationTurn?,
+    firstEntryInTurn: Boolean,
+): List<String> {
+    val turnNotices = if (firstEntryInTurn) turn?.protocolNotices().orEmpty() else emptyList()
+    val redundantItemProvenanceNotice = when {
+        turn?.provenance?.equals("PROVENANCE_KIND_IMPORTED_HISTORY", ignoreCase = true) == true -> "来自导入的历史记录"
+        turn?.provenance?.equals("PROVENANCE_KIND_HOST_SYNTHESIZED", ignoreCase = true) == true -> "由 Host 重建"
+        else -> null
+    }
+    val itemNotices = when (entry) {
+        is TimelineDisplayEntry.Message -> entry.item.protocolNotices()
+        is TimelineDisplayEntry.ProcessGroup -> entry.items.flatMap { it.protocolNotices() }
+        is TimelineDisplayEntry.TurnFailure -> emptyList()
+    }.filterNot { notice ->
+        (entry is TimelineDisplayEntry.Message && notice.startsWith("内容")) ||
+            notice == redundantItemProvenanceNotice
+    }
+    return (turnNotices + itemNotices).distinct()
 }
 
 internal sealed interface TimelineDisplayEntry {
@@ -1658,7 +1885,7 @@ private val ConversationPhases = setOf("loading_conversation", "starting_turn", 
 private val ProjectBusyPhases = setOf(
     "loading_directories", "loading_session_candidates", "creating_codex", "importing_session",
 )
-private val BusyPhases = setOf("starting_tailnet", "auth_required", "connecting_host", "refreshing") +
+private val BusyPhases = setOf("starting_tailnet", "auth_required", "connecting_host", "refreshing", "recovering_foreground") +
     ConversationPhases + ProjectBusyPhases + setOf("renaming_codex", "unmanaging_codex", "forgetting_codex")
 
 private fun phaseDescription(phase: String) = when (phase) {
@@ -1669,6 +1896,7 @@ private fun phaseDescription(phase: String) = when (phase) {
     "connecting_host" -> "正在连接 Host"
     "ready" -> "已连接"
     "refreshing" -> "正在刷新"
+    "recovering_foreground" -> "正在恢复连接"
     "loading_conversation" -> "正在加载会话"
     "starting_turn" -> "正在发送"
     "polling_turn" -> "Codex 正在处理"
@@ -1694,14 +1922,25 @@ private fun runningStatusDescription(status: String) = when (status.uppercase())
     else -> status
 }
 
+internal fun isResumableSessionAvailability(availability: String): Boolean =
+    availability.uppercase() in setOf("RESUMABLE", "SESSION_AVAILABILITY_RESUMABLE")
+
+internal fun isManagedSessionAvailability(availability: String): Boolean =
+    availability.uppercase() in setOf("ALREADY_MANAGED", "SESSION_AVAILABILITY_ALREADY_MANAGED")
+
+internal fun visibleProjectSessionCandidates(state: AppUiState): SessionCandidates? =
+    state.projectSessionCandidates?.takeIf { candidates ->
+        candidates.normalizedCwd.trim().trimEnd('/') == state.projectPath.trim().trimEnd('/')
+    }
+
 internal fun sessionAvailabilityDescription(availability: String, managed: Boolean = false) = when {
-    managed || availability.uppercase().endsWith("ALREADY_MANAGED") -> "已管理，点击打开"
-    availability.uppercase().endsWith("RESUMABLE") || availability.uppercase().endsWith("AVAILABLE") -> "可继续，点击导入"
-    availability.isBlank() -> "状态未知"
-    else -> when {
-        availability.uppercase().endsWith("MISSING") -> "会话不可用"
-        availability.uppercase().endsWith("UNAVAILABLE") -> "暂不可用"
-        else -> availability
+    managed || isManagedSessionAvailability(availability) -> "已管理，点击打开"
+    isResumableSessionAvailability(availability) -> "可继续，点击导入"
+    availability.isBlank() -> "状态未知，暂不可导入"
+    else -> when (availability.uppercase().removePrefix("SESSION_AVAILABILITY_")) {
+        "POSSIBLY_LIVE_ELSEWHERE" -> "可能正在其他客户端使用，暂不可导入"
+        "NOT_RESUMABLE" -> "无法继续此会话"
+        else -> "未知状态，暂不可导入"
     }
 }
 
@@ -1721,8 +1960,9 @@ internal fun parentProjectPath(path: String): String? {
 private fun PreviewScreen() {
     CodexRemoteTheme {
         CodexRemoteScreen(
-            AppUiState(), {}, {}, {}, {}, {}, {}, {}, {}, {},
-            {}, {}, {}, {}, {}, {}, { _, _ -> }, { _, _ -> }, {}, {},
+            state = AppUiState(),
+            onHostAddressChanged = {}, onConnect = {}, onRefresh = {}, onOpenAuth = {},
+            onOpenConversation = {}, onCloseConversation = {}, onDraftChanged = {}, onSend = {}, onStop = {},
         )
     }
 }

@@ -59,12 +59,23 @@ The running guest reported a 4096-byte page size. The packaged arm64
 successfully on the tested physical device, but neither fact substitutes for a
 test on a 16 KB guest.
 
-The latest full API 36 connected suite passed 25/25. A physical device has also
-been used against a real Tailnet and Host to verify connection, conversation
-history, `StartTurn`, and `InterruptTurn`. Rich timeline rendering, workspace,
-pending approval/user-input, and SAF upload/download were added later and have
-only JVM/API 36 emulator evidence so far; they have not all been revalidated on
-the physical device.
+The latest complete baseline passed MobileCore's normal and race-enabled Go
+tests, 108/108 JVM tests, and 45/45 connected tests on the standard API 36 AVD.
+The emulator suite covers connection/error presentation, project and session
+states, session management, rich timeline rendering, pending approval/user
+input, workspace and SAF boundaries, diagnostic export, and foreground recovery.
+
+Foreground recovery is deliberately bounded. After the app has been in the
+background for at least 10 seconds, returning to the foreground may restart the
+saved connection once and reselect the previously open Codex session. It does
+not interrupt a running turn, pending interaction, or active UI operation, and
+there is no background timer or reconnect loop.
+
+A physical device has been used against a real Tailnet and Host to verify
+connection, conversation history, `StartTurn`, and `InterruptTurn`. The later
+timeline, workspace, pending-request, SAF, diagnostic-export, and foreground-
+recovery flows have not all been revalidated on the physical device. Emulator
+coverage does not establish vivo OriginOS background behavior.
 
 ### Connected-test data warning
 
@@ -129,6 +140,7 @@ they are slow and large. Stop a running emulator with
 - `ANDROID_EMULATOR_DENSITY` (120-640; default 420)
 - `ANDROID_EMULATOR_HEAP_MB` (64-1024; default 256)
 
-Background residency, lock-screen/freeze behavior, power-management handling,
-and Clash VPN compatibility are explicitly frozen for the first version. The
-scripts do not exercise or claim support for them.
+The foreground recovery described above is implemented, but long-term OriginOS
+lock-screen/freeze residency and power-management behavior remain unverified.
+Clash-enabled physical-device behavior also has no dedicated validation. The
+scripts do not exercise or claim support for those scenarios.

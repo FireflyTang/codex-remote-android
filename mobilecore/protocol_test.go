@@ -332,7 +332,13 @@ func TestProtocolSessionManagementMappingsAndPagination(t *testing.T) {
 				if got := req.GetListSessionCandidates(); got.GetCwd() != "/work" || got.GetPage().GetPageToken() != "" {
 					t.Errorf("candidates page one=%+v", got)
 				}
-				response.Result = &remotev1.Response_ListSessionCandidates{ListSessionCandidates: &remotev1.ListSessionCandidatesResponse{NormalizedCwd: "/work", Sessions: []*remotev1.SessionCandidate{{SessionId: "S-1", Cwd: "/work", Title: "old", Preview: "p", Source: "rollout", Availability: remotev1.SessionAvailability_SESSION_AVAILABILITY_RESUMABLE, ManagedCodexId: "C-1"}}, Page: &remotev1.PageInfo{NextPageToken: "s2"}}}
+				response.Result = &remotev1.Response_ListSessionCandidates{ListSessionCandidates: &remotev1.ListSessionCandidatesResponse{NormalizedCwd: "/work", Sessions: []*remotev1.SessionCandidate{{
+					SessionId: "S-1", Cwd: "/work", Title: "old", Preview: "p", Source: "rollout",
+					CreatedAtUnixMs: 11, UpdatedAtUnixMs: 22,
+					Availability: remotev1.SessionAvailability_SESSION_AVAILABILITY_RESUMABLE, ManagedCodexId: "C-1",
+					Warnings:     []*remotev1.Warning{{Code: remotev1.WarningCode_WARNING_CODE_HISTORY_IMPORT_INCOMPLETE, Message: "partial", Metadata: map[string]string{"ignored": "large-or-private"}}},
+					Completeness: &remotev1.Completeness{Truncated: true, Incomplete: true, OriginalSizeBytes: 123, Reason: "bounded"},
+				}}, Page: &remotev1.PageInfo{NextPageToken: "s2"}}}
 			case 3:
 				if got := req.GetListSessionCandidates(); got.GetPage().GetPageToken() != "s2" {
 					t.Errorf("candidates page two=%+v", got)
@@ -384,6 +390,17 @@ func TestProtocolSessionManagementMappingsAndPagination(t *testing.T) {
 	candidates, err := client.ListSessionCandidates(ctx, "/work")
 	if err != nil || len(candidates.Sessions) != 2 || candidates.Sessions[0].ManagedCodexID != "C-1" {
 		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	firstCandidate := candidates.Sessions[0]
+	if firstCandidate.CreatedAtUnixMS != 11 || firstCandidate.UpdatedAtUnixMS != 22 || len(firstCandidate.Warnings) != 1 || firstCandidate.Warnings[0].Code != "WARNING_CODE_HISTORY_IMPORT_INCOMPLETE" || firstCandidate.Completeness == nil || !firstCandidate.Completeness.Truncated || !firstCandidate.Completeness.Incomplete {
+		t.Fatalf("candidate honesty projection=%+v", firstCandidate)
+	}
+	rawCandidate, err := json.Marshal(firstCandidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := string(rawCandidate); !strings.Contains(text, `"originalSizeBytes":123`) || strings.Contains(text, "large-or-private") || strings.Contains(text, "metadata") {
+		t.Fatalf("candidate honesty JSON=%s", text)
 	}
 	if id, err := client.CreateCodex(ctx, createCodexPayload{Cwd: "/new", CreateDirectoryIfMissing: true, Title: "New"}); err != nil || id != "C-NEW" {
 		t.Fatalf("create=(%q,%v)", id, err)
@@ -706,40 +723,48 @@ func testProtocolClient(t *testing.T, server *httptest.Server) *protocolClient {
 }
 
 func TestConversationItemProjectionAndMessageCompatibility(t *testing.T) {
-	turn := &remotev1.TurnSnapshot{TurnId: "TURN-1", Items: []*remotev1.Item{
-		{
-			ItemId: "U1", TurnId: "TURN-1", Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED,
-			Completeness: &remotev1.Completeness{Truncated: true, Incomplete: true, OriginalSizeBytes: 42, Reason: "bounded"},
-			Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Input: []*remotev1.UserInputPart{
-				{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "one"}}},
-				nil,
-				{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "two"}}},
-			}}},
-		},
-		{ItemId: "R1", Content: &remotev1.Item_ReasoningSummary{ReasoningSummary: &remotev1.ReasoningSummaryItem{Text: "why"}}},
-		{ItemId: "A1", Status: remotev1.ItemStatus_ITEM_STATUS_RUNNING, Content: &remotev1.Item_AgentMessage{AgentMessage: &remotev1.AgentMessageItem{Text: "answer"}}},
-		{ItemId: "P1", Content: &remotev1.Item_Plan{Plan: &remotev1.PlanItem{Steps: []*remotev1.PlanStep{{Text: "first", Status: "completed"}, nil, {Text: "next", Status: "in_progress"}}}}},
-		{ItemId: "C1", Content: &remotev1.Item_Command{Command: &remotev1.CommandItem{Argv: []string{"sh", "-c", "true"}, Cwd: "/work", Output: "ok", HasExitCode: true, ExitCode: 0}}},
-		{ItemId: "C2", Content: &remotev1.Item_Command{Command: &remotev1.CommandItem{Argv: nil, ExitCode: 9, HasExitCode: false}}},
-		{ItemId: "T1", Content: &remotev1.Item_Tool{Tool: &remotev1.ToolItem{ToolName: "search", Summary: "looking", ResultSummary: "found"}}},
-		{ItemId: "F1", Content: &remotev1.Item_FileChange{FileChange: &remotev1.FileChangeItem{
-			Changes: []*remotev1.FileChange{
-				{Path: "a", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_ADDED},
-				{Path: "b", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_MODIFIED},
-				{Path: "c", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_DELETED},
-				{Path: "d", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_RENAMED, OldPath: "old", NewPath: "new"},
-				{Path: "e", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_UNSPECIFIED},
-				nil,
+	turn := &remotev1.TurnSnapshot{
+		TurnId:       "TURN-1",
+		Completeness: &remotev1.Completeness{Incomplete: true, OriginalSizeBytes: 800, Reason: "history gap"},
+		Provenance:   remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY,
+		Items: []*remotev1.Item{
+			{
+				ItemId: "U1", TurnId: "TURN-1", Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED,
+				Completeness: &remotev1.Completeness{Truncated: true, Incomplete: true, OriginalSizeBytes: 42, Reason: "bounded"},
+				Provenance:   remotev1.ProvenanceKind_PROVENANCE_KIND_HOST_SYNTHESIZED,
+				Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Input: []*remotev1.UserInputPart{
+					{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "one"}}},
+					nil,
+					{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "two"}}},
+				}}},
 			},
-			UnifiedDiff: "@@ diff",
-		}}},
-		nil,
-		{ItemId: "NIL", Content: &remotev1.Item_AgentMessage{}},
-	}}
+			{ItemId: "R1", Content: &remotev1.Item_ReasoningSummary{ReasoningSummary: &remotev1.ReasoningSummaryItem{Text: "why"}}},
+			{ItemId: "A1", Status: remotev1.ItemStatus_ITEM_STATUS_RUNNING, Content: &remotev1.Item_AgentMessage{AgentMessage: &remotev1.AgentMessageItem{Text: "answer"}}},
+			{ItemId: "P1", Content: &remotev1.Item_Plan{Plan: &remotev1.PlanItem{Steps: []*remotev1.PlanStep{{Text: "first", Status: "completed"}, nil, {Text: "next", Status: "in_progress"}}}}},
+			{ItemId: "C1", Content: &remotev1.Item_Command{Command: &remotev1.CommandItem{Argv: []string{"sh", "-c", "true"}, Cwd: "/work", Output: "ok", HasExitCode: true, ExitCode: 0}}},
+			{ItemId: "C2", Content: &remotev1.Item_Command{Command: &remotev1.CommandItem{Argv: nil, ExitCode: 9, HasExitCode: false}}},
+			{ItemId: "T1", Content: &remotev1.Item_Tool{Tool: &remotev1.ToolItem{ToolName: "search", Summary: "looking", ResultSummary: "found"}}},
+			{ItemId: "F1", Content: &remotev1.Item_FileChange{FileChange: &remotev1.FileChangeItem{
+				Changes: []*remotev1.FileChange{
+					{Path: "a", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_ADDED},
+					{Path: "b", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_MODIFIED},
+					{Path: "c", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_DELETED},
+					{Path: "d", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_RENAMED, OldPath: "old", NewPath: "new"},
+					{Path: "e", Kind: remotev1.FileChangeKind_FILE_CHANGE_KIND_UNSPECIFIED},
+					nil,
+				},
+				UnifiedDiff: "@@ diff",
+			}}},
+			nil,
+			{ItemId: "NIL", Content: &remotev1.Item_AgentMessage{}},
+		}}
 
 	got := conversationTurnFromProto(turn)
 	if len(got.Items) != 10 {
 		t.Fatalf("items=%d, want 10", len(got.Items))
+	}
+	if got.Completeness == nil || !got.Completeness.Incomplete || got.Completeness.OriginalSizeBytes != 800 || got.Provenance != "PROVENANCE_KIND_IMPORTED_HISTORY" {
+		t.Errorf("turn honesty projection=%+v", got)
 	}
 	wantTypes := []string{"user_message", "reasoning_summary", "agent_message", "plan", "command", "command", "tool", "file_change", "unknown", "unknown"}
 	for i, want := range wantTypes {
@@ -751,7 +776,7 @@ func TestConversationItemProjectionAndMessageCompatibility(t *testing.T) {
 	if !reflect.DeepEqual(user.UserMessage.TextParts, []string{"one", "two"}) || user.UserMessage.Text != "one\ntwo" {
 		t.Errorf("userMessage=%+v", user.UserMessage)
 	}
-	if user.TurnID != "TURN-1" || user.Completeness == nil || !user.Completeness.Truncated || !user.Completeness.Incomplete || user.Completeness.OriginalSizeBytes != 42 || user.Completeness.Reason != "bounded" {
+	if user.TurnID != "TURN-1" || user.Completeness == nil || !user.Completeness.Truncated || !user.Completeness.Incomplete || user.Completeness.OriginalSizeBytes != 42 || user.Completeness.Reason != "bounded" || user.Provenance != "PROVENANCE_KIND_HOST_SYNTHESIZED" {
 		t.Errorf("user common projection=%+v", user)
 	}
 	if got.Items[1].ReasoningSummary.Text != "why" || got.Items[2].AgentMessage.Text != "answer" {
@@ -803,6 +828,33 @@ func TestConversationCommandExitCodeJSONPresence(t *testing.T) {
 	text := string(raw)
 	if strings.Count(text, `"exitCode":`) != 1 || !strings.Contains(text, `"hasExitCode":true,"exitCode":0`) || strings.Contains(text, `"hasExitCode":false,"exitCode"`) {
 		t.Fatalf("exit-code presence JSON=%s", text)
+	}
+}
+
+func TestCodexHonestyFieldsJSONOmitsArbitraryWarningMetadata(t *testing.T) {
+	raw, err := marshalCodexesForApp(&remotev1.ListCodexesResponse{Codexes: []*remotev1.Codex{{
+		CodexId: "C-1", ThreadId: "T-1", Cwd: "/work", Title: "demo",
+		Origin: remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING,
+		Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ActiveTurnId: "TURN-1",
+		CreatedAtUnixMs: 10, ImportedAtUnixMs: 20, LastActivityAtUnixMs: 30,
+		ManagementState:    remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON,
+		ManagedUntilUnixMs: 40,
+		Warnings: []*remotev1.Warning{{
+			Code: remotev1.WarningCode_WARNING_CODE_MANAGEMENT_EXPIRING_SOON, Message: "soon",
+			ManagedUntilUnixMs: 40, Metadata: map[string]string{"ignored": "large-or-private"},
+		}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{`"origin":"CODEX_ORIGIN_LOCAL_EXISTING"`, `"activeTurnId":"TURN-1"`, `"managedUntilUnixMs":"40"`, `"code":"WARNING_CODE_MANAGEMENT_EXPIRING_SOON"`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("Codex JSON missing %s: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "large-or-private") || strings.Contains(text, "metadata") {
+		t.Fatalf("Codex JSON leaked warning metadata: %s", text)
 	}
 }
 

@@ -125,13 +125,17 @@ type directoryListing struct {
 	Directories []directoryEntry `json:"directories"`
 }
 type sessionCandidate struct {
-	SessionID      string `json:"sessionId"`
-	Cwd            string `json:"cwd"`
-	Title          string `json:"title"`
-	Preview        string `json:"preview"`
-	Source         string `json:"source"`
-	Availability   string `json:"availability"`
-	ManagedCodexID string `json:"managedCodexId,omitempty"`
+	SessionID       string                    `json:"sessionId"`
+	Cwd             string                    `json:"cwd"`
+	Title           string                    `json:"title"`
+	Preview         string                    `json:"preview"`
+	Source          string                    `json:"source"`
+	CreatedAtUnixMS int64                     `json:"createdAtUnixMs,omitempty"`
+	UpdatedAtUnixMS int64                     `json:"updatedAtUnixMs,omitempty"`
+	Availability    string                    `json:"availability"`
+	ManagedCodexID  string                    `json:"managedCodexId,omitempty"`
+	Warnings        []protocolWarning         `json:"warnings,omitempty"`
+	Completeness    *conversationCompleteness `json:"completeness,omitempty"`
 }
 type sessionCandidatesState struct {
 	NormalizedCwd string             `json:"normalizedCwd"`
@@ -400,6 +404,7 @@ type conversationItem struct {
 	Type             string                        `json:"type"`
 	Status           string                        `json:"status"`
 	Completeness     *conversationCompleteness     `json:"completeness,omitempty"`
+	Provenance       string                        `json:"provenance,omitempty"`
 	UserMessage      *conversationUserMessage      `json:"userMessage,omitempty"`
 	AgentMessage     *conversationAgentMessage     `json:"agentMessage,omitempty"`
 	ReasoningSummary *conversationReasoningSummary `json:"reasoningSummary,omitempty"`
@@ -410,13 +415,15 @@ type conversationItem struct {
 }
 
 type conversationTurn struct {
-	TurnID            string                `json:"turnId"`
-	Status            string                `json:"status"`
-	StartedAtUnixMS   int64                 `json:"startedAtUnixMs"`
-	CompletedAtUnixMS int64                 `json:"completedAtUnixMs"`
-	Failure           string                `json:"failure,omitempty"`
-	Items             []conversationItem    `json:"items"`
-	Messages          []conversationMessage `json:"messages"`
+	TurnID            string                    `json:"turnId"`
+	Status            string                    `json:"status"`
+	StartedAtUnixMS   int64                     `json:"startedAtUnixMs"`
+	CompletedAtUnixMS int64                     `json:"completedAtUnixMs"`
+	Failure           string                    `json:"failure,omitempty"`
+	Completeness      *conversationCompleteness `json:"completeness,omitempty"`
+	Provenance        string                    `json:"provenance,omitempty"`
+	Items             []conversationItem        `json:"items"`
+	Messages          []conversationMessage     `json:"messages"`
 }
 
 type conversationState struct {
@@ -2029,8 +2036,8 @@ func validatePendingAnswers(userInput *pendingUserInput, answers []pendingUserIn
 }
 
 func (c *Core) pollConversation(ctx context.Context, sess session, conversationRunID uint64, commandID, codexID, targetTurnID string) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+	interval := conversationPollFastInterval
+	previousFingerprint := ""
 	for {
 		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		conversation, err := sess.ListHistory(callCtx, codexID)
@@ -2051,6 +2058,10 @@ func (c *Core) pollConversation(ctx context.Context, sess session, conversationR
 		}
 		c.state.CommandID, c.state.Phase, c.state.Error = commandID, "ready", ""
 		c.mergePendingLocked(&conversation)
+		fingerprint := conversationPollFingerprint(conversation)
+		changed := previousFingerprint == "" || fingerprint != previousFingerprint
+		previousFingerprint = fingerprint
+		interval = nextConversationPollInterval(interval, changed)
 		c.state.Conversation = &conversation
 		c.publishLocked()
 		if terminal {
@@ -2063,13 +2074,36 @@ func (c *Core) pollConversation(ctx context.Context, sess session, conversationR
 			return
 		}
 		c.mu.Unlock()
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			c.finishConversationOperation(conversationRunID, commandID, fmt.Errorf("conversation polling: %w", ctx.Err()))
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
+}
+
+const (
+	conversationPollFastInterval = 500 * time.Millisecond
+	conversationPollMaxInterval  = 2 * time.Second
+)
+
+func nextConversationPollInterval(current time.Duration, changed bool) time.Duration {
+	if changed || current < conversationPollFastInterval {
+		return conversationPollFastInterval
+	}
+	next := current * 2
+	if next > conversationPollMaxInterval {
+		return conversationPollMaxInterval
+	}
+	return next
+}
+
+func conversationPollFingerprint(conversation conversationState) string {
+	encoded, _ := json.Marshal(conversation)
+	return string(encoded)
 }
 
 func conversationTurnTerminal(turns []conversationTurn, target string) bool {

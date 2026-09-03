@@ -19,6 +19,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class AppUiState(
     val hostAddress: String = DefaultHostAddress,
@@ -30,7 +32,15 @@ data class AppUiState(
     val projectDialogOpen: Boolean = false,
     val projectPath: String = "",
     val pendingDirectoryCommandId: String = "",
+    val pendingSessionCandidatesCommandId: String = "",
+    val requestedSessionCandidatesPath: String = "",
+    val projectSessionCandidates: SessionCandidates? = null,
     val pendingProjectCommandId: String = "",
+    val pendingProjectCommandStage: String = "",
+    val pendingProjectAction: String = "",
+    val pendingProjectCodexId: String = "",
+    val missingDirectoryConfirmationPath: String = "",
+    val projectError: String = "",
     val conversationPage: ConversationPage = ConversationPage.CONVERSATION,
     val workspaceEditorOpen: Boolean = false,
     val workspaceEditorText: String = "",
@@ -56,6 +66,8 @@ data class AppUiState(
     val submittingRequestIds: Set<String> = emptySet(),
     val diagnosticMessage: String = "",
     val diagnosticFailed: Boolean = false,
+    val foregroundRecoveryInProgress: Boolean = false,
+    val foregroundRecoveryError: String = "",
 )
 
 data class WorkspaceDownloadReady(
@@ -81,8 +93,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val core: Core = Mobilecore.newCore(
         AndroidPlatformAdapter(application, ::acceptCoreState),
     )
+    // Core publishes every dispatch through its serialized notifier. Consuming the synchronous
+    // return here as a second channel can overtake an already queued operation completion.
     private val networkMonitor = AndroidNetworkMonitor(application) { command ->
-        acceptCoreState(core.dispatch(command))
+        core.dispatch(command)
     }
     private val clientId = "android-" + (
         Settings.Secure.getString(application.contentResolver, Settings.Secure.ANDROID_ID)
@@ -97,6 +111,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull(),
     )
     private val coreErrorLogger = CoreErrorLogDeduplicator()
+    private val foregroundResumeGate = ForegroundResumeGate()
+    private val foregroundRecoveryTracker = ForegroundRecoveryTracker()
+    private val projectOperationSingleFlight = ProjectOperationSingleFlight()
+    private val diagnosticActionTracker = DiagnosticActionTracker()
 
     init {
         diagnosticLog.append("app.started", "version=$clientVersion")
@@ -119,9 +137,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { hostPreferences.setHostAddress(value) }
     }
 
-    fun connect() {
-        val endpoint = uiState.value.hostAddress.trim()
+    fun connect() = connectInternal(foregroundRecovery = false)
+
+    fun onActivityStarted(nowElapsedRealtimeMs: Long) {
+        if (!foregroundResumeGate.onStarted(nowElapsedRealtimeMs)) return
+        if (foregroundRecoveryAction(uiState.value) == ForegroundRecoveryAction.CONNECT) {
+            connectInternal(foregroundRecovery = true)
+        }
+    }
+
+    fun onActivityStopped(nowElapsedRealtimeMs: Long, changingConfigurations: Boolean) {
+        foregroundResumeGate.onStopped(nowElapsedRealtimeMs, changingConfigurations)
+    }
+
+    private fun connectInternal(foregroundRecovery: Boolean) {
+        val startingState = uiState.value
+        val endpoint = startingState.hostAddress.trim()
         if (endpoint.isEmpty()) return
+        if (foregroundRecovery) {
+            _uiState.update(::foregroundRecoveryStartingState)
+        } else {
+            _uiState.update { it.copy(foregroundRecoveryError = "") }
+        }
         diagnosticLog.append("core.command", "type=connect")
         viewModelScope.launch(Dispatchers.IO) {
             hostPreferences.setHostAddress(endpoint)
@@ -133,8 +170,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .put("clientRunId", UUID.randomUUID().toString())
                 .put("clientName", "codex-remote-android")
                 .put("clientVersion", clientVersion)
-            connectCommands(payload).forEach { command ->
-                acceptCoreState(core.dispatch(command.toString()))
+            val commands = connectCommands(payload)
+            if (foregroundRecovery) {
+                foregroundRecoveryTracker.begin(
+                    startCommandId = commands.last().getString("id"),
+                    originalCodexId = startingState.openCodexId?.takeIf { it.isNotBlank() },
+                )
+            }
+            commands.forEach { command ->
+                dispatchTracked(command, "connection")
             }
         }
     }
@@ -155,20 +199,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 projectDialogOpen = true,
                 projectPath = path,
                 pendingDirectoryCommandId = "",
+                pendingSessionCandidatesCommandId = "",
+                requestedSessionCandidatesPath = "",
+                projectSessionCandidates = null,
                 pendingProjectCommandId = "",
+                pendingProjectCommandStage = "",
+                pendingProjectAction = "",
+                pendingProjectCodexId = "",
+                missingDirectoryConfirmationPath = "",
+                projectError = "",
             )
         }
         listDirectories(path)
     }
 
     fun closeProjectDialog() {
+        projectOperationSingleFlight.release()
         _uiState.update {
-            it.copy(projectDialogOpen = false, pendingDirectoryCommandId = "", pendingProjectCommandId = "")
+            it.copy(
+                projectDialogOpen = false,
+                pendingDirectoryCommandId = "",
+                pendingSessionCandidatesCommandId = "",
+                requestedSessionCandidatesPath = "",
+                projectSessionCandidates = null,
+                pendingProjectCommandId = "",
+                pendingProjectCommandStage = "",
+                pendingProjectAction = "",
+                pendingProjectCodexId = "",
+                missingDirectoryConfirmationPath = "",
+                projectError = "",
+            )
         }
     }
 
     fun setProjectPath(value: String) {
-        _uiState.update { it.copy(projectPath = value) }
+        _uiState.update {
+            it.copy(
+                projectPath = value,
+                pendingDirectoryCommandId = "",
+                pendingSessionCandidatesCommandId = "",
+                requestedSessionCandidatesPath = "",
+                projectSessionCandidates = null,
+                missingDirectoryConfirmationPath = "",
+                projectError = "",
+            )
+        }
     }
 
     fun listDirectories(path: String = uiState.value.projectPath) {
@@ -176,18 +251,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (requestedPath.isEmpty()) return
         val command = coreCommand("list_directories", JSONObject().put("parentPath", requestedPath))
         _uiState.update {
-            it.copy(projectPath = requestedPath, pendingDirectoryCommandId = command.getString("id"))
+            it.copy(
+                projectPath = requestedPath,
+                pendingDirectoryCommandId = command.getString("id"),
+                pendingSessionCandidatesCommandId = "",
+                requestedSessionCandidatesPath = "",
+                projectSessionCandidates = null,
+                projectError = "",
+            )
         }
         viewModelScope.launch(Dispatchers.IO) {
-            acceptCoreState(core.dispatch(command.toString()))
+            dispatchTracked(command, "project.list_directories")
         }
     }
 
     fun listSessionCandidates() {
         val path = uiState.value.projectPath.trim()
         if (path.isEmpty()) return
+        val command = coreCommand("list_session_candidates", JSONObject().put("cwd", path))
+        _uiState.update {
+            it.copy(
+                pendingSessionCandidatesCommandId = command.getString("id"),
+                requestedSessionCandidatesPath = path,
+                projectSessionCandidates = null,
+                projectError = "",
+            )
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            dispatch("list_session_candidates", JSONObject().put("cwd", path))
+            dispatchTracked(command, "project.list_sessions")
         }
     }
 
@@ -195,9 +286,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val path = uiState.value.projectPath.trim()
         if (path.isEmpty()) return
         dispatchProjectOperation(
-            "create_codex",
-            JSONObject().put("cwd", path).put("createDirectoryIfMissing", true),
+            createCodexCommand(path, createDirectoryIfMissing = false),
         )
+    }
+
+    fun confirmCreateMissingDirectory() {
+        val path = uiState.value.missingDirectoryConfirmationPath.trim()
+        if (path.isEmpty() || path != uiState.value.projectPath.trim()) return
+        _uiState.update { it.copy(missingDirectoryConfirmationPath = "", projectError = "") }
+        dispatchProjectOperation(
+            createCodexCommand(path, createDirectoryIfMissing = true),
+        )
+    }
+
+    fun cancelCreateMissingDirectory() {
+        _uiState.update { it.copy(missingDirectoryConfirmationPath = "") }
     }
 
     fun importSession(sessionId: String, source: String) {
@@ -220,13 +323,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun forgetCodex(codexId: String) = dispatchCodexAction("forget_codex", codexId)
 
     fun openConversation(codexId: String) {
-        val managedProjectCommand = if (uiState.value.projectDialogOpen) {
+        if (codexId.isBlank()) return
+        val openingFromProjectDialog = uiState.value.projectDialogOpen
+        if (openingFromProjectDialog && !projectOperationSingleFlight.tryAcquire()) return
+        val managedProjectCommand = if (openingFromProjectDialog) {
             coreCommand("select_codex", JSONObject().put("codexId", codexId))
         } else null
         _uiState.update {
             it.copy(
                 openCodexId = if (managedProjectCommand == null) codexId else it.openCodexId,
                 pendingProjectCommandId = managedProjectCommand?.getString("id") ?: it.pendingProjectCommandId,
+                pendingProjectCommandStage = if (managedProjectCommand != null) ProjectStageSelection else it.pendingProjectCommandStage,
+                pendingProjectAction = if (managedProjectCommand != null) "select_codex" else it.pendingProjectAction,
+                pendingProjectCodexId = if (managedProjectCommand != null) codexId else it.pendingProjectCodexId,
+                projectError = if (managedProjectCommand != null) "" else it.projectError,
                 stoppingTurn = false,
                 conversationPage = ConversationPage.CONVERSATION,
                 workspaceEditorOpen = false,
@@ -254,7 +364,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
-            if (managedProjectCommand != null) acceptCoreState(core.dispatch(managedProjectCommand.toString()))
+            if (managedProjectCommand != null) dispatchTracked(managedProjectCommand, "project.selection")
             else dispatch("select_codex", JSONObject().put("codexId", codexId))
         }
     }
@@ -594,7 +704,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (!accepted) return
         viewModelScope.launch(Dispatchers.IO) {
-            acceptCoreState(core.dispatch(respondApprovalCommand(requestId, decision).toString()))
+            dispatchTracked(respondApprovalCommand(requestId, decision), "pending.response")
         }
     }
 
@@ -662,26 +772,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val request = acceptedRequest ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            acceptCoreState(core.dispatch(respondUserInputCommand(request, acceptedDrafts).toString()))
+            dispatchTracked(respondUserInputCommand(request, acceptedDrafts), "pending.response")
         }
     }
 
     private fun dispatch(type: String, payload: JSONObject? = null) {
-        diagnosticLog.append("core.command", "type=$type")
         val command = coreCommand(type, payload)
-        acceptCoreState(core.dispatch(command.toString()))
+        dispatchTracked(command, "general")
     }
 
     private fun dispatchWorkspace(command: JSONObject) {
+        dispatchTracked(command, "workspace")
+    }
+
+    private fun dispatchTracked(command: JSONObject, stage: String) {
+        if (stage.startsWith("project") || stage == "workspace" || stage == "pending.response") {
+            diagnosticActionTracker.register(command, stage)
+        }
+        diagnosticLog.append("core.action", diagnosticCommandDetails(command, stage))
         acceptCoreState(core.dispatch(command.toString()))
     }
 
-    private fun dispatchProjectOperation(type: String, payload: JSONObject) {
-        val command = coreCommand(type, payload)
+    private fun dispatchProjectOperation(command: JSONObject) {
+        if (!projectOperationSingleFlight.tryAcquire()) return
         val commandId = command.getString("id")
-        _uiState.update { it.copy(pendingProjectCommandId = commandId) }
-        viewModelScope.launch(Dispatchers.IO) { acceptCoreState(core.dispatch(command.toString())) }
+        val type = command.getString("type")
+        _uiState.update {
+            it.copy(
+                pendingProjectCommandId = commandId,
+                pendingProjectCommandStage = ProjectStageMutation,
+                pendingProjectAction = type,
+                pendingProjectCodexId = "",
+                projectError = "",
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) { dispatchTracked(command, "project.mutation") }
     }
+
+    private fun dispatchProjectOperation(type: String, payload: JSONObject) =
+        dispatchProjectOperation(coreCommand(type, payload))
 
     private fun dispatchCodexAction(type: String, codexId: String) {
         if (codexId.isBlank()) return
@@ -699,25 +828,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val decoded = runCatching { decodeCoreState(raw) }.getOrElse { error ->
             CoreState(phase = "error", error = "无法解析 MobileCore 状态：${error.message}")
         }
+        val revisionEligible = shouldAcceptCoreRevision(_uiState.value.core.revision, decoded.revision)
+        val foregroundResolution = if (revisionEligible) {
+            foregroundRecoveryTracker.onCoreState(decoded)
+        } else {
+            ForegroundRecoveryResolution.None
+        }
+        val selectForegroundCodex = (foregroundResolution as? ForegroundRecoveryResolution.SelectCodex)?.let {
+            coreCommand("select_codex", JSONObject().put("codexId", it.codexId)).also { command ->
+                foregroundRecoveryTracker.trackSelection(command.getString("id"))
+            }
+        }
         coreStateDiagnosticRecorder.record(decoded)
+        diagnosticActionTracker.consumeTerminal(decoded, _uiState.value)?.let { tracked ->
+            diagnosticLog.append("core.action.result", diagnosticResultDetails(decoded, tracked, _uiState.value))
+        }
         var listWorkspaceAfterGet: Pair<String, String>? = null
         var refreshWorkspaceDirectory: Pair<String, String>? = null
         var recoverWorkspaceAfterUploadFailure: Pair<String, String>? = null
         var projectPathToRemember: String? = null
+        var selectProjectAfterMutation: JSONObject? = null
+        var projectFlowFinished = false
         _uiState.update { current ->
             projectPathToRemember = null
-            if (decoded.revision < current.core.revision) {
+            projectFlowFinished = false
+            if (!shouldAcceptCoreRevision(current.core.revision, decoded.revision)) {
                 current
             } else {
-                val projectCommandOutcome = projectCommandOutcome(current, decoded)
-                val completedProject = projectCommandOutcome == ProjectCommandOutcome.SUCCESS
-                val failedProject = projectCommandOutcome == ProjectCommandOutcome.FAILURE
+                val projectResolution = projectCommandResolution(current, decoded)
+                val completedProject = projectResolution.outcome == ProjectCommandOutcome.SUCCESS
+                val confirmMissingDirectory = shouldConfirmMissingDirectory(current, decoded, projectResolution)
+                val failedProject = projectResolution.outcome == ProjectCommandOutcome.FAILURE && !confirmMissingDirectory
+                projectFlowFinished = completedProject || failedProject || confirmMissingDirectory
+                val selectRequired = projectResolution.outcome == ProjectCommandOutcome.SELECT_REQUIRED
+                val selectionCommand = if (selectRequired) {
+                    coreCommand("select_codex", JSONObject().put("codexId", projectResolution.codexId))
+                        .also { selectProjectAfterMutation = it }
+                } else null
                 if (completedProject) {
                     projectPathToRemember = successfulProjectPath(current, decoded)
                 }
                 val directoryResolution = resolveDirectoryResult(
                     current.projectPath, current.pendingDirectoryCommandId, decoded,
                 )
+                val directoryCompleted = current.pendingDirectoryCommandId.isNotBlank() &&
+                    decoded.commandId == current.pendingDirectoryCommandId &&
+                    (decoded.phase == "ready" || decoded.error.isNotBlank())
+                val candidatesCompleted = current.pendingSessionCandidatesCommandId.isNotBlank() &&
+                    decoded.commandId == current.pendingSessionCandidatesCommandId &&
+                    current.projectPath.trim() == current.requestedSessionCandidatesPath &&
+                    (decoded.phase == "ready" || decoded.error.isNotBlank())
+                val normalizedCandidatePath = decoded.sessionCandidates?.normalizedCwd.orEmpty().trim()
+                val candidatesSucceeded = candidatesCompleted && decoded.error.isBlank() &&
+                    decoded.sessionCandidates != null && normalizedCandidatePath.isNotBlank()
                 val returnedWorkspace = decoded.workspace
                 val getCompleted = current.pendingWorkspaceGetCommandId.isNotBlank() &&
                     decoded.commandId == current.pendingWorkspaceGetCommandId &&
@@ -767,6 +930,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val decodedActiveConversation = decoded.conversation?.takeIf {
                     it.codexId == current.openCodexId
                 }
+                val recoveryFailed = foregroundResolution as? ForegroundRecoveryResolution.Failed
+                val recoveryFinished = foregroundResolution is ForegroundRecoveryResolution.Finished || recoveryFailed != null
                 var next = current.copy(
                     core = decoded,
                     userInputDrafts = decodedActiveConversation?.let { conversation ->
@@ -783,16 +948,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     } ?: current.submittingRequestIds,
                     projectDialogOpen = if (completedProject) false else current.projectDialogOpen,
-                    projectPath = directoryResolution.path,
+                    projectPath = when {
+                        candidatesSucceeded && normalizedCandidatePath.isNotBlank() -> normalizedCandidatePath
+                        else -> directoryResolution.path
+                    },
                     pendingDirectoryCommandId = directoryResolution.pendingCommandId,
-                    pendingProjectCommandId = if (completedProject || failedProject) "" else current.pendingProjectCommandId,
-                    openCodexId = if (completedProject) decoded.selectedCodexId else current.openCodexId,
+                    pendingSessionCandidatesCommandId = if (candidatesCompleted) "" else current.pendingSessionCandidatesCommandId,
+                    requestedSessionCandidatesPath = if (candidatesCompleted) "" else current.requestedSessionCandidatesPath,
+                    projectSessionCandidates = when {
+                        candidatesSucceeded -> decoded.sessionCandidates
+                        candidatesCompleted -> null
+                        else -> current.projectSessionCandidates
+                    },
+                    pendingProjectCommandId = when {
+                        selectionCommand != null -> selectionCommand.getString("id")
+                        completedProject || failedProject || confirmMissingDirectory -> ""
+                        else -> current.pendingProjectCommandId
+                    },
+                    pendingProjectCommandStage = when {
+                        selectionCommand != null -> ProjectStageSelection
+                        completedProject || failedProject || confirmMissingDirectory -> ""
+                        else -> current.pendingProjectCommandStage
+                    },
+                    pendingProjectAction = when {
+                        completedProject || failedProject || confirmMissingDirectory -> ""
+                        else -> current.pendingProjectAction
+                    },
+                    pendingProjectCodexId = when {
+                        selectionCommand != null -> projectResolution.codexId
+                        completedProject || failedProject || confirmMissingDirectory -> ""
+                        else -> current.pendingProjectCodexId
+                    },
+                    missingDirectoryConfirmationPath = when {
+                        confirmMissingDirectory -> current.projectPath.trim()
+                        completedProject -> ""
+                        else -> current.missingDirectoryConfirmationPath
+                    },
+                    projectError = when {
+                        confirmMissingDirectory -> ""
+                        failedProject || (directoryCompleted && decoded.error.isNotBlank()) ||
+                            (candidatesCompleted && !candidatesSucceeded) ->
+                            decoded.error.ifBlank { "Host 返回的项目结果不完整，请重试" }
+                        selectRequired || completedProject || candidatesSucceeded || directoryCompleted -> ""
+                        else -> current.projectError
+                    },
                     stoppingTurn = current.stoppingTurn && decoded.conversation?.running == true && decoded.error.isBlank(),
                     pendingWorkspaceGetCommandId = if (getCompleted) "" else current.pendingWorkspaceGetCommandId,
                     pendingWorkspaceRefreshDirectory = if (getCompleted) "" else current.pendingWorkspaceRefreshDirectory,
                     pendingWorkspaceReadCommandId = if (fileCompleted || fileFailed) "" else current.pendingWorkspaceReadCommandId,
                     pendingWorkspaceFilePath = if (fileCompleted || fileFailed) "" else pendingPath,
-                    workspaceEditorOpen = if (fileCompleted) true else current.workspaceEditorOpen,
                     workspaceEditorText = if (fileCompleted) returnedWorkspace?.openFile?.utf8Text.orEmpty() else current.workspaceEditorText,
                     pendingWorkspaceUploadCommandId = if (uploadSucceeded || uploadFailed) "" else current.pendingWorkspaceUploadCommandId,
                     pendingWorkspaceUploadPath = if (uploadSucceeded || uploadFailed) "" else current.pendingWorkspaceUploadPath,
@@ -823,6 +1027,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         uploadRecoveryCompleted || uploadSucceeded -> false
                         else -> current.workspaceUploadRecoveryPartial
                     },
+                    foregroundRecoveryInProgress = when {
+                        recoveryFinished -> false
+                        else -> current.foregroundRecoveryInProgress
+                    },
+                    foregroundRecoveryError = when {
+                        recoveryFailed != null -> recoveryFailed.message
+                        foregroundResolution is ForegroundRecoveryResolution.Finished -> ""
+                        else -> current.foregroundRecoveryError
+                    },
+                    openCodexId = when {
+                        recoveryFailed != null -> null
+                        foregroundResolution is ForegroundRecoveryResolution.Finished &&
+                            foregroundResolution.codexId != null -> foregroundResolution.codexId
+                        completedProject -> projectResolution.codexId
+                        else -> current.openCodexId
+                    },
+                    conversationPage = if (recoveryFinished) ConversationPage.CONVERSATION else current.conversationPage,
+                    workspaceEditorOpen = when {
+                        recoveryFailed != null -> false
+                        fileCompleted -> true
+                        else -> current.workspaceEditorOpen
+                    },
                 )
                 if (uploadSucceeded || downloadFailed || uploadRecoveryCompleted) next = clearWorkspaceTransferContext(next)
                 next
@@ -832,6 +1058,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             Log.e(CoreLogTag, message)
         }
         projectPathToRemember?.let(::rememberProjectPath)
+        if (projectFlowFinished) projectOperationSingleFlight.release()
+        selectProjectAfterMutation?.let { command ->
+            viewModelScope.launch(Dispatchers.IO) {
+                dispatchTracked(command, "project.selection")
+            }
+        }
+        selectForegroundCodex?.let { command ->
+            viewModelScope.launch(Dispatchers.IO) {
+                dispatchTracked(command, "foreground.selection")
+            }
+        }
         listWorkspaceAfterGet?.let { (codexId, directory) ->
             viewModelScope.launch(Dispatchers.IO) {
                 val workspace = uiState.value.core.workspace
@@ -901,6 +1138,148 @@ internal fun redactCoreErrorForLog(error: String): String {
     )
 }
 
+internal fun diagnosticCommandDetails(command: JSONObject, stage: String): String {
+    val payload = command.optJSONObject("payload")
+    val fields = mutableListOf(
+        "commandId=${diagnosticField(command.optString("id"))}",
+        "action=${diagnosticField(command.optString("type"))}",
+        "stage=${diagnosticField(stage)}",
+    )
+    listOf(
+        "cwd", "parentPath", "relativeDirectory", "relativePath", "destinationPath",
+        "codexId", "sessionId", "approvalId", "requestId",
+    ).forEach { key ->
+        payload?.optString(key)?.takeIf { it.isNotBlank() }?.let { fields += "$key=${diagnosticField(it)}" }
+    }
+    if (payload?.has("createDirectoryIfMissing") == true) {
+        fields += "createDirectoryIfMissing=${payload.optBoolean("createDirectoryIfMissing")}"
+    }
+    val byteCount = when (command.optString("type")) {
+        "write_workspace_text_file" -> payload?.optString("utf8Text")?.toByteArray(Charsets.UTF_8)?.size
+        "upload_workspace_entry" -> payload?.optString("contentBase64")?.let(::base64DecodedByteCount)
+        else -> null
+    }
+    if (byteCount != null) fields += "byteCount=$byteCount"
+    return fields.joinToString("; ")
+}
+
+internal data class DiagnosticTrackedAction(
+    val commandId: String,
+    val action: String,
+    val stage: String,
+    val requestId: String = "",
+)
+
+internal class DiagnosticActionTracker {
+    private val actions = ConcurrentHashMap<String, DiagnosticTrackedAction>()
+
+    fun register(command: JSONObject, stage: String) {
+        val commandId = command.optString("id")
+        if (commandId.isBlank()) return
+        val payload = command.optJSONObject("payload")
+        actions[commandId] = DiagnosticTrackedAction(
+            commandId = commandId,
+            action = command.optString("type"),
+            stage = stage,
+            requestId = payload?.optString("requestId").orEmpty()
+                .ifBlank { payload?.optString("approvalId").orEmpty() },
+        )
+    }
+
+    fun consumeTerminal(state: CoreState, current: AppUiState): DiagnosticTrackedAction? {
+        val tracked = actions[state.commandId] ?: return null
+        if (!isDiagnosticActionTerminal(state, current, tracked)) return null
+        return if (actions.remove(state.commandId, tracked)) tracked else null
+    }
+}
+
+internal fun isDiagnosticActionTerminal(
+    state: CoreState,
+    current: AppUiState,
+    tracked: DiagnosticTrackedAction,
+): Boolean = when (tracked.stage) {
+    "workspace" -> state.workspace?.loading == "none"
+    "pending.response" -> {
+        if (state.error.isNotBlank()) true else {
+            val request = state.conversation?.pendingRequests?.find { it.requestId == tracked.requestId }
+            state.conversation != null && (request == null || request.resolved || request.error != null)
+        }
+    }
+    "project.list_directories" ->
+        current.pendingDirectoryCommandId == tracked.commandId &&
+            (state.error.isNotBlank() || (state.phase == "ready" && state.directoryListing != null))
+    "project.list_sessions" ->
+        current.pendingSessionCandidatesCommandId == tracked.commandId &&
+            (state.error.isNotBlank() || (state.phase == "ready" && state.sessionCandidates != null))
+    "project.mutation", "project.selection" ->
+        projectCommandResolution(current, state).outcome in setOf(
+            ProjectCommandOutcome.SELECT_REQUIRED,
+            ProjectCommandOutcome.SUCCESS,
+            ProjectCommandOutcome.FAILURE,
+        )
+    else -> false
+}
+
+internal fun diagnosticResultDetails(
+    state: CoreState,
+    tracked: DiagnosticTrackedAction,
+    current: AppUiState = AppUiState(),
+): String = buildList {
+    add("commandId=${diagnosticField(state.commandId)}")
+    add("action=${diagnosticField(tracked.action)}")
+    add("result=${diagnosticActionOutcome(state, tracked, current)}")
+    add("revision=${state.revision}")
+    val resultByteCount = when (tracked.action) {
+        "read_workspace_text_file" -> state.workspace?.openFile?.entry?.sizeBytes
+        "write_workspace_text_file" -> state.workspace?.lastWrite?.entry?.sizeBytes
+        "upload_workspace_entry" -> state.workspace?.uploadResult?.entry?.sizeBytes
+        "download_workspace_entry" -> state.workspace?.downloadResult?.entry?.sizeBytes
+        else -> null
+    }
+    if (resultByteCount != null) add("byteCount=$resultByteCount")
+    if (state.error.isNotBlank()) {
+        add("error=${diagnosticField(DiagnosticRedactor.redact(redactCoreErrorForLog(state.error)))}")
+    }
+    state.workspace?.error?.let { error ->
+        add("errorCode=${diagnosticField(error.code)}")
+        if (error.message.isNotBlank()) add("error=${diagnosticField(DiagnosticRedactor.redact(error.message))}")
+    }
+    if (tracked.stage == "pending.response") {
+        state.conversation?.pendingRequests?.find { it.requestId == tracked.requestId }?.error?.let { error ->
+            add("errorCode=${diagnosticField(error.code)}")
+            if (error.message.isNotBlank()) add("error=${diagnosticField(DiagnosticRedactor.redact(error.message))}")
+        }
+    }
+}.joinToString("; ")
+
+internal fun diagnosticActionOutcome(
+    state: CoreState,
+    tracked: DiagnosticTrackedAction,
+    current: AppUiState,
+): String = when (tracked.stage) {
+    "workspace" -> if (state.workspace?.error != null || state.error.isNotBlank()) "error" else "success"
+    "pending.response" -> {
+        val requestError = state.conversation?.pendingRequests
+            ?.find { it.requestId == tracked.requestId }?.error
+        if (requestError != null || state.error.isNotBlank()) "error" else "success"
+    }
+    "project.list_directories", "project.list_sessions" ->
+        if (state.error.isNotBlank()) "error" else "success"
+    "project.mutation", "project.selection" ->
+        if (projectCommandResolution(current, state).outcome == ProjectCommandOutcome.FAILURE) "error" else "success"
+    else -> if (state.phase == "error" || state.error.isNotBlank()) "error" else "success"
+}
+
+private fun diagnosticField(value: String): String =
+    value.replace(Regex("[\\r\\n;]+"), " ").trim().take(512)
+
+private fun base64DecodedByteCount(value: String): Int {
+    val trimmed = value.trim()
+    if (trimmed.isEmpty()) return 0
+    val padding = trimmed.takeLast(2).count { it == '=' }
+    return (trimmed.length * 3 / 4 - padding).coerceAtLeast(0)
+}
+
 internal fun initialProjectPath(state: AppUiState): String {
     normalizeStoredProjectPath(state.lastProjectPath).takeIf { it.isNotBlank() }?.let { return it }
     state.core.codexes.firstOrNull { it.id == state.openCodexId }?.cwd?.trim()
@@ -915,16 +1294,44 @@ internal fun successfulProjectPath(current: AppUiState, decoded: CoreState): Str
     return projectPathToPersist(true, selectedCwd, current.projectPath)
 }
 
-internal enum class ProjectCommandOutcome { NONE, SUCCESS, FAILURE }
+internal const val ProjectStageMutation = "mutation"
+internal const val ProjectStageSelection = "selection"
 
-internal fun projectCommandOutcome(current: AppUiState, decoded: CoreState): ProjectCommandOutcome {
+internal fun isMissingDirectoryError(error: String): Boolean =
+    error.contains("directory does not exist", ignoreCase = true)
+
+internal fun shouldConfirmMissingDirectory(
+    current: AppUiState,
+    decoded: CoreState,
+    resolution: ProjectCommandResolution = projectCommandResolution(current, decoded),
+): Boolean = resolution.outcome == ProjectCommandOutcome.FAILURE &&
+    current.pendingProjectCommandStage == ProjectStageMutation &&
+    current.pendingProjectAction == "create_codex" &&
+    decoded.commandId == current.pendingProjectCommandId &&
+    isMissingDirectoryError(decoded.error)
+
+internal enum class ProjectCommandOutcome { NONE, SELECT_REQUIRED, SUCCESS, FAILURE }
+
+internal data class ProjectCommandResolution(
+    val outcome: ProjectCommandOutcome,
+    val codexId: String = "",
+)
+
+internal fun projectCommandResolution(current: AppUiState, decoded: CoreState): ProjectCommandResolution {
     val matches = current.projectDialogOpen && current.pendingProjectCommandId.isNotBlank() &&
         decoded.commandId == current.pendingProjectCommandId
-    if (!matches) return ProjectCommandOutcome.NONE
+    if (!matches) return ProjectCommandResolution(ProjectCommandOutcome.NONE)
+    if (decoded.error.isNotBlank()) return ProjectCommandResolution(ProjectCommandOutcome.FAILURE)
     return when {
-        decoded.phase == "ready" && decoded.selectedCodexId.isNotBlank() -> ProjectCommandOutcome.SUCCESS
-        decoded.error.isNotBlank() -> ProjectCommandOutcome.FAILURE
-        else -> ProjectCommandOutcome.NONE
+        current.pendingProjectCommandStage == ProjectStageMutation &&
+            decoded.phase == "ready" && decoded.selectedCodexId.isNotBlank() ->
+            ProjectCommandResolution(ProjectCommandOutcome.SELECT_REQUIRED, decoded.selectedCodexId)
+        current.pendingProjectCommandStage == ProjectStageSelection &&
+            decoded.phase == "ready" && current.pendingProjectCodexId.isNotBlank() &&
+            decoded.selectedCodexId == current.pendingProjectCodexId &&
+            decoded.conversation?.codexId == current.pendingProjectCodexId ->
+            ProjectCommandResolution(ProjectCommandOutcome.SUCCESS, current.pendingProjectCodexId)
+        else -> ProjectCommandResolution(ProjectCommandOutcome.NONE)
     }
 }
 
@@ -955,6 +1362,160 @@ internal fun resolveDirectoryResult(
 internal fun activeConversation(state: AppUiState): ConversationState? =
     state.core.conversation?.takeIf { it.codexId == state.openCodexId }
 
+internal class ProjectOperationSingleFlight {
+    private val inFlight = AtomicBoolean(false)
+
+    fun tryAcquire(): Boolean = inFlight.compareAndSet(false, true)
+
+    fun release() {
+        inFlight.set(false)
+    }
+}
+
+internal const val ForegroundBackgroundThresholdMs = 10_000L
+
+internal class ForegroundResumeGate(
+    private val thresholdMs: Long = ForegroundBackgroundThresholdMs,
+) {
+    private var hasStarted = false
+    private var backgroundedAtMs: Long? = null
+
+    @Synchronized
+    fun onStarted(nowMs: Long): Boolean {
+        if (!hasStarted) {
+            hasStarted = true
+            return false
+        }
+        val stoppedAt = backgroundedAtMs ?: return false
+        backgroundedAtMs = null
+        return nowMs >= stoppedAt && nowMs - stoppedAt >= thresholdMs
+    }
+
+    @Synchronized
+    fun onStopped(nowMs: Long, changingConfigurations: Boolean) {
+        if (hasStarted && !changingConfigurations) backgroundedAtMs = nowMs
+    }
+}
+
+internal enum class ForegroundRecoveryAction { NONE, CONNECT }
+
+internal fun foregroundRecoveryStartingState(state: AppUiState): AppUiState = state.copy(
+    foregroundRecoveryInProgress = true,
+    foregroundRecoveryError = "",
+    conversationPage = ConversationPage.CONVERSATION,
+    workspaceEditorOpen = false,
+)
+
+internal sealed interface ForegroundRecoveryResolution {
+    data object None : ForegroundRecoveryResolution
+    data class SelectCodex(val codexId: String) : ForegroundRecoveryResolution
+    data class Finished(val codexId: String?) : ForegroundRecoveryResolution
+    data class Failed(val message: String) : ForegroundRecoveryResolution
+}
+
+internal class ForegroundRecoveryTracker {
+    private var originalCodexId: String? = null
+    private var startCommandId = ""
+    private var selectionCommandId = ""
+    private var waitingToTrackSelection = false
+
+    @Synchronized
+    fun begin(startCommandId: String, originalCodexId: String?) {
+        this.startCommandId = startCommandId
+        this.originalCodexId = originalCodexId
+        selectionCommandId = ""
+        waitingToTrackSelection = false
+    }
+
+    @Synchronized
+    fun trackSelection(commandId: String) {
+        if (waitingToTrackSelection) {
+            selectionCommandId = commandId
+            waitingToTrackSelection = false
+        }
+    }
+
+    @Synchronized
+    fun onCoreState(state: CoreState): ForegroundRecoveryResolution {
+        if (startCommandId.isBlank() && selectionCommandId.isBlank() && !waitingToTrackSelection) {
+            return ForegroundRecoveryResolution.None
+        }
+        if (state.commandId == startCommandId) {
+            if (state.phase == "error" || state.error.isNotBlank()) {
+                return fail(state.error.ifBlank { "恢复 Host 连接失败" })
+            }
+            if (state.phase != "ready") return ForegroundRecoveryResolution.None
+            startCommandId = ""
+            val codexId = originalCodexId
+            if (codexId == null) {
+                clear()
+                return ForegroundRecoveryResolution.Finished(null)
+            }
+            waitingToTrackSelection = true
+            return ForegroundRecoveryResolution.SelectCodex(codexId)
+        }
+        if (state.commandId == selectionCommandId) {
+            if (state.phase == "error" || state.error.isNotBlank()) {
+                return fail(state.error.ifBlank { "恢复原会话失败" })
+            }
+            if (state.phase != "ready") return ForegroundRecoveryResolution.None
+            val expectedCodexId = originalCodexId
+            return if (expectedCodexId != null && state.conversation?.codexId == expectedCodexId) {
+                clear()
+                ForegroundRecoveryResolution.Finished(expectedCodexId)
+            } else {
+                fail("Host 未返回原会话，已退回首页")
+            }
+        }
+        return ForegroundRecoveryResolution.None
+    }
+
+    private fun fail(message: String): ForegroundRecoveryResolution.Failed {
+        clear()
+        return ForegroundRecoveryResolution.Failed(message)
+    }
+
+    private fun clear() {
+        originalCodexId = null
+        startCommandId = ""
+        selectionCommandId = ""
+        waitingToTrackSelection = false
+    }
+}
+
+internal fun foregroundRecoveryAction(state: AppUiState): ForegroundRecoveryAction {
+    if (foregroundRecoveryBlocked(state)) return ForegroundRecoveryAction.NONE
+    return when (state.core.phase) {
+        "ready", "idle" ->
+            if (state.hostAddress.isNotBlank()) ForegroundRecoveryAction.CONNECT else ForegroundRecoveryAction.NONE
+        else -> ForegroundRecoveryAction.NONE
+    }
+}
+
+private fun foregroundRecoveryBlocked(state: AppUiState): Boolean {
+    val conversation = state.core.conversation
+    val pendingInteraction = conversation?.pendingRequests.orEmpty().any { request ->
+        !request.resolved && (request.type == "approval" || request.type == "user_input")
+    }
+    val pendingUiOperation = state.stoppingTurn || state.pendingDirectoryCommandId.isNotBlank() ||
+        state.pendingSessionCandidatesCommandId.isNotBlank() || state.pendingProjectCommandId.isNotBlank() ||
+        state.pendingWorkspaceGetCommandId.isNotBlank() || state.pendingWorkspaceReadCommandId.isNotBlank() ||
+        state.pendingWorkspaceUploadCommandId.isNotBlank() || state.pendingWorkspaceDownloadCommandId.isNotBlank() ||
+        state.workspaceLocalTransferStatus != "none" || state.submittingRequestIds.isNotEmpty()
+    return state.foregroundRecoveryInProgress || conversation?.running == true || pendingInteraction || pendingUiOperation ||
+        state.core.phase in ForegroundRecoveryBusyPhases
+}
+
+private val ForegroundRecoveryBusyPhases = setOf(
+    "starting_tailnet", "auth_required", "connecting_host", "refreshing",
+    "loading_conversation", "starting_turn", "polling_turn", "interrupting_turn",
+    "loading_directories", "loading_session_candidates", "creating_codex", "importing_session",
+    "renaming_codex", "unmanaging_codex", "forgetting_codex",
+)
+
+internal fun shouldAcceptCoreRevision(currentRevision: Long, incomingRevision: Long): Boolean =
+    incomingRevision >= currentRevision
+
 internal fun connectCommands(configurePayload: JSONObject): List<JSONObject> = listOf(
     coreCommand("stop"),
     coreCommand("configure", configurePayload),
@@ -967,6 +1528,12 @@ internal fun coreCommand(type: String, payload: JSONObject? = null): JSONObject 
         .put("id", UUID.randomUUID().toString())
         .put("type", type)
         .apply { if (payload != null) put("payload", payload) }
+
+internal fun createCodexCommand(cwd: String, createDirectoryIfMissing: Boolean): JSONObject =
+    coreCommand(
+        "create_codex",
+        JSONObject().put("cwd", cwd).put("createDirectoryIfMissing", createDirectoryIfMissing),
+    )
 
 internal fun respondApprovalCommand(approvalId: String, decision: String) =
     coreCommand(

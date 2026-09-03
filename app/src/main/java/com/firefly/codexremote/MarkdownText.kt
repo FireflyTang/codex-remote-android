@@ -15,12 +15,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.LinkInteractionListener
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.commonmark.ext.autolink.AutolinkExtension
@@ -43,6 +46,7 @@ import org.commonmark.node.SoftLineBreak
 import org.commonmark.node.StrongEmphasis
 import org.commonmark.node.Text as MarkdownTextNode
 import org.commonmark.parser.Parser
+import java.net.URI
 
 private val markdownParser: Parser = Parser.builder()
     .extensions(
@@ -62,8 +66,11 @@ internal fun MarkdownBody(
     val text = markdown.ifBlank { emptyText }
     val codeBackground = MaterialTheme.colorScheme.surfaceVariant
     val linkColor = MaterialTheme.colorScheme.primary
-    val blocks = remember(text, codeBackground, linkColor) {
-        renderMarkdownBlocks(text, codeBackground, linkColor)
+    val uriHandler = LocalUriHandler.current
+    val blocks = remember(text, codeBackground, linkColor, uriHandler) {
+        renderMarkdownBlocks(text, codeBackground, linkColor) { url ->
+            runCatching { uriHandler.openUri(url) }
+        }
     }
     Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)) {
         blocks.forEach { block ->
@@ -103,6 +110,7 @@ internal fun renderMarkdownBlocks(
     markdown: String,
     codeBackground: Color = Color(0xFFECE7DC),
     linkColor: Color = Color(0xFF0B57D0),
+    onOpenLink: ((String) -> Unit)? = null,
 ): List<MarkdownUiBlock> = runCatching {
     val root = markdownParser.parse(markdown)
     buildList {
@@ -110,7 +118,7 @@ internal fun renderMarkdownBlocks(
         var richStart: Node? = null
         fun flushRich(stopBefore: Node?) {
             richStart?.let { start ->
-                MarkdownComposer(codeBackground, linkColor).composeRange(start, stopBefore)
+                MarkdownComposer(codeBackground, linkColor, onOpenLink).composeRange(start, stopBefore)
                     .takeIf { it.isNotBlank() }
                     ?.let { add(MarkdownUiBlock.RichText(it)) }
             }
@@ -139,13 +147,23 @@ internal fun renderMarkdown(
     markdown: String,
     codeBackground: Color = Color(0xFFECE7DC),
     linkColor: Color = Color(0xFF0B57D0),
+    onOpenLink: ((String) -> Unit)? = null,
 ): AnnotatedString =
-    runCatching { MarkdownComposer(codeBackground, linkColor).compose(markdownParser.parse(markdown)) }
+    runCatching { MarkdownComposer(codeBackground, linkColor, onOpenLink).compose(markdownParser.parse(markdown)) }
         .getOrElse { AnnotatedString(markdown) }
+
+internal fun allowedExternalHttpUrl(destination: String): String? = runCatching {
+    val uri = URI(destination)
+    destination.takeIf {
+        (uri.scheme.equals("http", ignoreCase = true) || uri.scheme.equals("https", ignoreCase = true)) &&
+            !uri.host.isNullOrBlank()
+    }
+}.getOrNull()
 
 private class MarkdownComposer(
     private val codeBackground: Color,
     private val linkColor: Color,
+    private val onOpenLink: ((String) -> Unit)?,
 ) {
     private val builder = AnnotatedString.Builder()
 
@@ -266,18 +284,35 @@ private class MarkdownComposer(
                 ) {
                     builder.append(currentNode.literal)
                 }
-                is Link -> withStyle(
-                    SpanStyle(
-                        color = linkColor,
-                        textDecoration = TextDecoration.Underline,
-                    ),
-                ) {
-                    renderInlineSequence(currentNode.firstChild, listDepth)
-                }
+                is Link -> renderLink(currentNode, listDepth)
                 else -> renderInlineSequence(currentNode.firstChild, listDepth)
             }
             current = current.next
         }
+    }
+
+    private fun renderLink(node: Link, listDepth: Int) {
+        val destination = allowedExternalHttpUrl(node.destination)
+        val openLink = onOpenLink
+        if (destination != null && openLink != null) {
+            builder.pushLink(
+                LinkAnnotation.Url(
+                    destination,
+                    linkInteractionListener = LinkInteractionListener {
+                        runCatching { openLink(destination) }
+                    },
+                ),
+            )
+        }
+        withStyle(
+            SpanStyle(
+                color = linkColor,
+                textDecoration = TextDecoration.Underline,
+            ),
+        ) {
+            renderInlineSequence(node.firstChild, listDepth)
+        }
+        if (destination != null && openLink != null) builder.pop()
     }
 
     private fun endsWith(char: Char): Boolean =

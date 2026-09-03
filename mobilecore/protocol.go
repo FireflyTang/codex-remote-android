@@ -14,6 +14,7 @@ import (
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/coder/websocket"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type responseResult struct {
@@ -40,6 +41,55 @@ type pendingResponseResult struct {
 	RequestID string
 	TurnID    string
 	ItemID    string
+}
+
+// protocolWarning deliberately omits the protocol's arbitrary metadata map.
+// The stable code, human-readable message, and lease deadline are sufficient
+// for this client to render an honest bounded notice.
+type protocolWarning struct {
+	Code               string `json:"code"`
+	Message            string `json:"message,omitempty"`
+	ManagedUntilUnixMS int64  `json:"managedUntilUnixMs,omitempty"`
+}
+
+func protocolWarningsFromProto(warnings []*remotev1.Warning) []protocolWarning {
+	if len(warnings) == 0 {
+		return nil
+	}
+	out := make([]protocolWarning, 0, len(warnings))
+	for _, warning := range warnings {
+		if warning == nil {
+			continue
+		}
+		out = append(out, protocolWarning{
+			Code:               warning.Code.String(),
+			Message:            warning.Message,
+			ManagedUntilUnixMS: warning.ManagedUntilUnixMs,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func completenessFromProto(value *remotev1.Completeness) *conversationCompleteness {
+	if value == nil {
+		return nil
+	}
+	return &conversationCompleteness{
+		Truncated:         value.Truncated,
+		Incomplete:        value.Incomplete,
+		OriginalSizeBytes: value.OriginalSizeBytes,
+		Reason:            value.Reason,
+	}
+}
+
+func provenanceString(value remotev1.ProvenanceKind) string {
+	if value == remotev1.ProvenanceKind_PROVENANCE_KIND_UNSPECIFIED {
+		return ""
+	}
+	return value.String()
 }
 
 type protocolPendingWatch struct {
@@ -148,11 +198,26 @@ func (c *protocolClient) Fetch(ctx context.Context) ([]byte, []byte, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal GetHost state: %w", err)
 	}
-	codexJSON, err := (protojson.MarshalOptions{}).Marshal(codexes)
+	codexJSON, err := marshalCodexesForApp(codexes)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal ListCodexes state: %w", err)
 	}
 	return hostJSON, codexJSON, nil
+}
+
+func marshalCodexesForApp(codexes *remotev1.ListCodexesResponse) ([]byte, error) {
+	// Warning metadata is an arbitrary map intended for protocol diagnostics,
+	// not app state. Preserve all stable Codex fields and warning notices while
+	// keeping state payloads bounded to the product-facing schema.
+	sanitized := proto.Clone(codexes).(*remotev1.ListCodexesResponse)
+	for _, codex := range sanitized.Codexes {
+		for _, warning := range codex.GetWarnings() {
+			if warning != nil {
+				warning.Metadata = nil
+			}
+		}
+	}
+	return (protojson.MarshalOptions{}).Marshal(sanitized)
 }
 
 const listPageSize = 100
@@ -237,7 +302,19 @@ func (c *protocolClient) ListSessionCandidates(ctx context.Context, cwd string) 
 		out.NormalizedCwd = result.NormalizedCwd
 		for _, candidate := range result.Sessions {
 			if candidate != nil {
-				out.Sessions = append(out.Sessions, sessionCandidate{SessionID: candidate.SessionId, Cwd: candidate.Cwd, Title: candidate.Title, Preview: candidate.Preview, Source: candidate.Source, Availability: candidate.Availability.String(), ManagedCodexID: candidate.ManagedCodexId})
+				out.Sessions = append(out.Sessions, sessionCandidate{
+					SessionID:       candidate.SessionId,
+					Cwd:             candidate.Cwd,
+					Title:           candidate.Title,
+					Preview:         candidate.Preview,
+					Source:          candidate.Source,
+					CreatedAtUnixMS: candidate.CreatedAtUnixMs,
+					UpdatedAtUnixMS: candidate.UpdatedAtUnixMs,
+					Availability:    candidate.Availability.String(),
+					ManagedCodexID:  candidate.ManagedCodexId,
+					Warnings:        protocolWarningsFromProto(candidate.Warnings),
+					Completeness:    completenessFromProto(candidate.Completeness),
+				})
 			}
 		}
 		next := result.GetPage().GetNextPageToken()
@@ -1032,6 +1109,8 @@ func conversationTurnFromProto(turn *remotev1.TurnSnapshot) conversationTurn {
 	out.Status = turnStatusString(turn.Status)
 	out.StartedAtUnixMS = turn.StartedAtUnixMs
 	out.CompletedAtUnixMS = turn.CompletedAtUnixMs
+	out.Completeness = completenessFromProto(turn.Completeness)
+	out.Provenance = provenanceString(turn.Provenance)
 	if turn.Failure != nil {
 		out.Failure = turn.Failure.Message
 	}
@@ -1056,14 +1135,8 @@ func conversationItemFromProto(item *remotev1.Item) conversationItem {
 	out.ItemID = item.ItemId
 	out.TurnID = item.TurnId
 	out.Status = itemStatusString(item.Status)
-	if completeness := item.Completeness; completeness != nil {
-		out.Completeness = &conversationCompleteness{
-			Truncated:         completeness.Truncated,
-			Incomplete:        completeness.Incomplete,
-			OriginalSizeBytes: completeness.OriginalSizeBytes,
-			Reason:            completeness.Reason,
-		}
-	}
+	out.Completeness = completenessFromProto(item.Completeness)
+	out.Provenance = provenanceString(item.Provenance)
 	switch content := item.Content.(type) {
 	case *remotev1.Item_UserMessage:
 		if content.UserMessage == nil {
