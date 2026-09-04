@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
+	"github.com/coder/websocket"
 )
 
 func TestLiveSessionReconnectSwapsOnceForConcurrentWatchFailures(t *testing.T) {
@@ -39,6 +42,67 @@ func TestLiveSessionReconnectSwapsOnceForConcurrentWatchFailures(t *testing.T) {
 	}
 	if calls.Load() != 1 || session.currentClient() != replacement {
 		t.Fatalf("redials=%d client=%p want=%p", calls.Load(), session.currentClient(), replacement)
+	}
+}
+
+func TestLiveSessionImageUploadReconnectReusesRequestID(t *testing.T) {
+	content := []byte("image")
+	digest := "6105d6cc76af400325e94d588ce511be5bfdbb73b437dc51eca43917d7a43e3d"
+	seenRequestID := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{WebSocketSubprotocol}})
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		_ = readTestFrame(t, ctx, conn)
+		hello := completeServerHello(0)
+		hello.Capabilities.ImageAttachments = &remotev1.ImageAttachmentCapabilities{Supported: true, MaxUploadBytes: 1024, SupportedMimeTypes: []string{"image/png"}, UnreferencedRetentionMs: 60_000}
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: hello}})
+		request := readTestFrame(t, ctx, conn).GetRequest()
+		seenRequestID <- request.GetRequestId()
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: request.RequestId, Result: &remotev1.Response_UploadImageAttachment{UploadImageAttachment: &remotev1.UploadImageAttachmentResponse{Attachment: &remotev1.ImageAttachment{AttachmentId: "ATTACH-1", Filename: "photo.png", MimeType: "image/png", SizeBytes: uint64(len(content)), Sha256: digest}}}}}})
+	}))
+	defer server.Close()
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	replacement, err := dialProtocol(ctx, configPayload{HostEndpoint: "fake-host", ClientID: "client", ClientRunID: "run", ClientName: "test", ClientVersion: "test"}, dial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	failed := &protocolClient{closed: true}
+	session := &liveSession{client: failed, redial: func(context.Context) (*protocolClient, error) { return replacement, nil }}
+	result, err := session.UploadImageAttachment(ctx, "UPLOAD-STABLE", imageAttachmentUploadRequest{CodexID: "CODEX-1", Filename: "photo.png", MimeType: "image/png", Content: content, SHA256: digest})
+	if err != nil || result.Attachment.AttachmentID != "ATTACH-1" {
+		t.Fatalf("upload after reconnect=%+v err=%v", result, err)
+	}
+	if got := <-seenRequestID; got != "UPLOAD-STABLE" {
+		t.Fatalf("retry request ID=%q, want stable command ID", got)
+	}
+}
+
+func TestLiveSessionImageAttachmentSupportUsesCurrentClientAfterReconnect(t *testing.T) {
+	firstHello := completeServerHello(0)
+	firstHello.Capabilities.ImageAttachments = &remotev1.ImageAttachmentCapabilities{Supported: true, MaxUploadBytes: 1024, SupportedMimeTypes: []string{"image/png"}, UnreferencedRetentionMs: 60_000}
+	secondHello := completeServerHello(0)
+	secondHello.Capabilities.ImageAttachments = &remotev1.ImageAttachmentCapabilities{Supported: true, MaxUploadBytes: 256, SupportedMimeTypes: []string{"image/jpeg"}, UnreferencedRetentionMs: 30_000}
+	session := &liveSession{client: &protocolClient{hello: firstHello}}
+	before, supported, err := session.ImageAttachmentSupport()
+	if err != nil || !supported || before.MaxUploadBytes != 1024 || before.SupportedMimeTypes[0] != "image/png" {
+		t.Fatalf("initial capabilities=%+v supported=%t err=%v", before, supported, err)
+	}
+	session.mu.Lock()
+	session.client = &protocolClient{hello: secondHello}
+	session.mu.Unlock()
+	after, supported, err := session.ImageAttachmentSupport()
+	if err != nil || !supported || after.MaxUploadBytes != 256 || after.SupportedMimeTypes[0] != "image/jpeg" || after.UnreferencedRetentionMS != 30_000 {
+		t.Fatalf("reconnected capabilities=%+v supported=%t err=%v", after, supported, err)
 	}
 }
 

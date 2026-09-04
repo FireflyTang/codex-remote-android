@@ -2,6 +2,7 @@ package mobilecore
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,10 +89,11 @@ func TestProtocolHandshakeGetHostListCodexesAndPing(t *testing.T) {
 		defer conn.CloseNow()
 		ctx := r.Context()
 		frame := readTestFrame(t, ctx, conn)
-		if frame.GetClientHello().GetProtocolVersion().GetPatch() != 2 {
+		version := frame.GetClientHello().GetProtocolVersion()
+		if version.GetMajor() != 1 || version.GetMinor() != 2 || version.GetPatch() != 0 {
 			t.Errorf("bad ClientHello: %v", frame)
 		}
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Ping{Ping: &remotev1.Ping{Nonce: 9, SentAtUnixMs: 123}}})
 		for responses := 0; responses < 2; {
 			frame = readTestFrame(t, ctx, conn)
@@ -158,7 +160,7 @@ func TestRequestIDsAreUniqueAcrossConnectionsWithSameClientRunID(t *testing.T) {
 		defer conn.CloseNow()
 		ctx := r.Context()
 		hello := readTestFrame(t, ctx, conn).GetClientHello()
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 		seen := observation{connection: int(connectionSequence.Add(1)), runID: hello.GetClientRunId()}
 		for i := 0; i < 2; i++ {
 			req := readTestFrame(t, ctx, conn).GetRequest()
@@ -254,7 +256,7 @@ func TestConcurrentCallsHaveUniqueIDsAndMatchOutOfOrderResponses(t *testing.T) {
 		defer conn.CloseNow()
 		ctx := r.Context()
 		_ = readTestFrame(t, ctx, conn).GetClientHello()
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 		requests := make([]*remotev1.Request, 0, callCount)
 		for i := 0; i < callCount; i++ {
 			req := readTestFrame(t, ctx, conn).GetRequest()
@@ -355,7 +357,7 @@ func TestProtocolPendingWatchAndResponses(t *testing.T) {
 		defer conn.CloseNow()
 		ctx := r.Context()
 		_ = readTestFrame(t, ctx, conn)
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 
 		watch := readTestFrame(t, ctx, conn).GetRequest()
 		if got := watch.GetWatchCodex(); got.GetCodexId() != "CODEX-1" || got.AfterEventSeq != nil || got.GetAfterHostRunId() != "" {
@@ -444,7 +446,7 @@ func TestProtocolWatchResumedKeepsRequestedCursorUntilReplayIsReduced(t *testing
 		defer conn.CloseNow()
 		ctx := r.Context()
 		_ = readTestFrame(t, ctx, conn)
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 		request := readTestFrame(t, ctx, conn).GetRequest()
 		watch := request.GetWatchCodex()
 		if watch.GetCodexId() != "C1" || watch.AfterEventSeq == nil || watch.GetAfterEventSeq() != 5 || watch.GetAfterHostRunId() != "run" {
@@ -564,7 +566,7 @@ func TestProtocolConversationHistoryPaginationStartAndInterrupt(t *testing.T) {
 		defer conn.CloseNow()
 		ctx := r.Context()
 		_ = readTestFrame(t, ctx, conn)
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 
 		first := readTestFrame(t, ctx, conn).GetRequest()
 		if got := first.GetListHistory(); got.GetCodexId() != "CODEX-1" || got.GetPage().GetPageToken() != "" {
@@ -574,7 +576,7 @@ func TestProtocolConversationHistoryPaginationStartAndInterrupt(t *testing.T) {
 		writeConversationResponse(t, ctx, conn, first.RequestId, &remotev1.HistoryPage{
 			CodexId: "CODEX-1", Page: &remotev1.PageInfo{NextPageToken: "p2"},
 			Turns: []*remotev1.TurnSnapshot{{TurnId: "TURN-OLD", Status: remotev1.TurnStatus_TURN_STATUS_COMPLETED, Items: []*remotev1.Item{
-				{ItemId: "U1", Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED, Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Input: []*remotev1.UserInputPart{{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "hello"}}}}}}},
+				{ItemId: "U1", Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED, Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Parts: []*remotev1.UserMessagePart{{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: "hello"}}}}}}},
 			}}},
 		})
 
@@ -636,6 +638,101 @@ func TestProtocolConversationHistoryPaginationStartAndInterrupt(t *testing.T) {
 	}
 }
 
+func TestProtocolImageAttachmentRetryMixedTurnDownloadAndHistory(t *testing.T) {
+	content := []byte("image")
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	width, height := uint32(2), uint32(3)
+	descriptor := &remotev1.ImageAttachment{AttachmentId: "ATTACH-1", Filename: "photo.png", MimeType: "image/png", SizeBytes: uint64(len(content)), Sha256: digest, WidthPixels: &width, HeightPixels: &height}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{WebSocketSubprotocol}})
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		_ = readTestFrame(t, ctx, conn)
+		hello := completeServerHello(0)
+		hello.Capabilities.ImageAttachments = &remotev1.ImageAttachmentCapabilities{Supported: true, MaxUploadBytes: 1024, SupportedMimeTypes: []string{"image/png"}, UnreferencedRetentionMs: 60_000}
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: hello}})
+
+		for attempt := 0; attempt < 2; attempt++ {
+			request := readTestFrame(t, ctx, conn).GetRequest()
+			upload := request.GetUploadImageAttachment()
+			if request.GetRequestId() != "UPLOAD-STABLE" || upload.GetCodexId() != "CODEX-1" || upload.GetFilename() != "photo.png" || upload.GetMimeType() != "image/png" || string(upload.GetContent()) != string(content) || upload.GetSha256() != digest {
+				t.Errorf("upload attempt %d changed request identity or payload: id=%q upload=%+v", attempt, request.GetRequestId(), upload)
+				return
+			}
+			writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: request.RequestId, Result: &remotev1.Response_UploadImageAttachment{UploadImageAttachment: &remotev1.UploadImageAttachmentResponse{Attachment: descriptor, Deduplicated: attempt == 1}}}}})
+		}
+
+		download := readTestFrame(t, ctx, conn).GetRequest()
+		if download.GetRequestId() != "DOWNLOAD-1" || download.GetDownloadImageAttachment().GetAttachmentId() != "ATTACH-1" {
+			t.Errorf("download=%+v", download)
+			return
+		}
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: download.RequestId, Result: &remotev1.Response_DownloadImageAttachment{DownloadImageAttachment: &remotev1.DownloadImageAttachmentResponse{Attachment: descriptor, Content: content}}}}})
+
+		badDownload := readTestFrame(t, ctx, conn).GetRequest()
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: badDownload.RequestId, Result: &remotev1.Response_DownloadImageAttachment{DownloadImageAttachment: &remotev1.DownloadImageAttachmentResponse{Attachment: descriptor, Content: []byte("wrong")}}}}})
+
+		start := readTestFrame(t, ctx, conn).GetRequest()
+		input := start.GetStartTurn().GetInput()
+		if start.GetRequestId() != "TURN-MIXED" || len(input) != 3 || input[0].GetText().GetText() != "before" || input[1].GetImage().GetAttachmentId() != "ATTACH-1" || input[2].GetText().GetText() != "after" {
+			t.Errorf("mixed StartTurn order changed: %+v", start)
+			return
+		}
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: start.RequestId, Result: &remotev1.Response_StartTurn{StartTurn: &remotev1.StartTurnResponse{TurnId: "TURN-1"}}}}})
+
+		history := readTestFrame(t, ctx, conn).GetRequest()
+		writeConversationResponse(t, ctx, conn, history.RequestId, &remotev1.HistoryPage{CodexId: "CODEX-1", HistoryComplete: true, Turns: []*remotev1.TurnSnapshot{{TurnId: "TURN-1", Items: []*remotev1.Item{{ItemId: "USER-1", Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Parts: []*remotev1.UserMessagePart{
+			{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: "before"}}},
+			{Content: &remotev1.UserMessagePart_Image{Image: descriptor}},
+			{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: "after"}}},
+		}}}}}}}})
+	}))
+	defer server.Close()
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := dialProtocol(ctx, configPayload{HostEndpoint: "fake-host", ClientID: "client", ClientRunID: "run", ClientName: "test", ClientVersion: "test"}, dial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	request := imageAttachmentUploadRequest{CodexID: "CODEX-1", Filename: "photo.png", MimeType: "image/png", Content: content, SHA256: digest}
+	first, err := client.UploadImageAttachment(ctx, "UPLOAD-STABLE", request)
+	if err != nil || first.Attachment.AttachmentID != "ATTACH-1" || first.Deduplicated {
+		t.Fatalf("first upload=%+v err=%v", first, err)
+	}
+	retry, err := client.UploadImageAttachment(ctx, "UPLOAD-STABLE", request)
+	if err != nil || !retry.Deduplicated || retry.Attachment.AttachmentID != first.Attachment.AttachmentID {
+		t.Fatalf("retry upload=%+v err=%v", retry, err)
+	}
+	download, err := client.DownloadImageAttachment(ctx, "DOWNLOAD-1", "CODEX-1", "ATTACH-1")
+	if err != nil || download.ContentBase64 != "aW1hZ2U=" || download.Attachment.WidthPixels == nil || *download.Attachment.WidthPixels != 2 {
+		t.Fatalf("download=%+v err=%v", download, err)
+	}
+	if _, err := client.DownloadImageAttachment(ctx, "DOWNLOAD-BAD", "CODEX-1", "ATTACH-1"); err == nil || !strings.Contains(err.Error(), "does not match descriptor") {
+		t.Fatalf("corrupt download error=%v", err)
+	}
+	turnID, err := client.StartTurnParts(ctx, "TURN-MIXED", "CODEX-1", []turnInputPart{{Type: "text", Text: "before"}, {Type: "image", AttachmentID: "ATTACH-1"}, {Type: "text", Text: "after"}}, nil)
+	if err != nil || turnID != "TURN-1" {
+		t.Fatalf("mixed StartTurn=(%q,%v)", turnID, err)
+	}
+	history, err := client.ListHistory(ctx, "CODEX-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := history.Turns[0].Items[0].UserMessage.Parts
+	if len(parts) != 3 || parts[0].Type != "text" || parts[1].Type != "image" || parts[1].Image == nil || parts[1].Image.AttachmentID != "ATTACH-1" || parts[2].Text != "after" {
+		t.Fatalf("history mixed parts lost order or descriptor: %+v", parts)
+	}
+}
+
 func TestProtocolSessionManagementMappingsAndPagination(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{WebSocketSubprotocol}})
@@ -646,7 +743,7 @@ func TestProtocolSessionManagementMappingsAndPagination(t *testing.T) {
 		defer conn.CloseNow()
 		ctx := r.Context()
 		_ = readTestFrame(t, ctx, conn)
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 		for i := 0; i < 10; i++ {
 			req := readTestFrame(t, ctx, conn).GetRequest()
 			response := &remotev1.Response{RequestId: req.RequestId}
@@ -766,7 +863,7 @@ func TestProtocolSessionManagementMismatchAndHostError(t *testing.T) {
 		defer conn.CloseNow()
 		ctx := r.Context()
 		_ = readTestFrame(t, ctx, conn)
-		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(0)}})
 		first := readTestFrame(t, ctx, conn).GetRequest()
 		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: first.RequestId, Result: &remotev1.Response_ListCodexes{ListCodexes: &remotev1.ListCodexesResponse{}}}}})
 		second := readTestFrame(t, ctx, conn).GetRequest()
@@ -951,7 +1048,7 @@ func TestProtocolWorkspaceRejectsMismatchesLoopAndHostError(t *testing.T) {
 }
 
 func TestProtocolWorkspaceCapabilityAndWriteLimitGates(t *testing.T) {
-	client := &protocolClient{hello: completeServerHello(2)}
+	client := &protocolClient{hello: completeServerHello(0)}
 	if _, supported, err := client.WorkspaceSupport(); err != nil || supported {
 		t.Fatalf("absent workspace=(%t,%v)", supported, err)
 	}
@@ -1008,7 +1105,7 @@ func TestWorkspaceDownloadMetadataAssociation(t *testing.T) {
 }
 
 func workspaceServerHello() *remotev1.ServerHello {
-	hello := completeServerHello(2)
+	hello := completeServerHello(0)
 	hello.Capabilities.MaxPageSize = 2
 	hello.Capabilities.Workspace = &remotev1.WorkspaceCapabilities{
 		MaxTextFileBytes: 1024, MaxInlineUploadBytes: 2048, MaxInlineDownloadBytes: 4096,
@@ -1065,10 +1162,10 @@ func TestConversationItemProjectionAndMessageCompatibility(t *testing.T) {
 				ItemId: "U1", TurnId: "TURN-1", Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED,
 				Completeness: &remotev1.Completeness{Truncated: true, Incomplete: true, OriginalSizeBytes: 42, Reason: "bounded"},
 				Provenance:   remotev1.ProvenanceKind_PROVENANCE_KIND_HOST_SYNTHESIZED,
-				Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Input: []*remotev1.UserInputPart{
-					{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "one"}}},
+				Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Parts: []*remotev1.UserMessagePart{
+					{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: "one"}}},
 					nil,
-					{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "two"}}},
+					{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: "two"}}},
 				}}},
 			},
 			{ItemId: "R1", Content: &remotev1.Item_ReasoningSummary{ReasoningSummary: &remotev1.ReasoningSummaryItem{Text: "why"}}},
@@ -1146,6 +1243,44 @@ func TestConversationItemProjectionAndMessageCompatibility(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Messages, wantMessages) {
 		t.Errorf("messages=%+v, want %+v", got.Messages, wantMessages)
+	}
+}
+
+func TestConversationImagePartsPreserveValidDescriptorsAndInvalidPositions(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	valid := &remotev1.ImageAttachment{AttachmentId: "ATTACH-VALID", Filename: "valid.png", MimeType: "image/png", SizeBytes: 7, Sha256: digest}
+	invalid := &remotev1.ImageAttachment{AttachmentId: "ATTACH-INVALID", Filename: "invalid.png", MimeType: "image/", SizeBytes: 7, Sha256: digest}
+	projected := conversationItemFromProto(&remotev1.Item{ItemId: "USER-1", Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Parts: []*remotev1.UserMessagePart{
+		{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: "before"}}},
+		{Content: &remotev1.UserMessagePart_Image{Image: valid}},
+		{Content: &remotev1.UserMessagePart_Image{Image: invalid}},
+		{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: "after"}}},
+	}}}})
+	if projected.UserMessage == nil || len(projected.UserMessage.Parts) != 4 {
+		t.Fatalf("image part positions were lost: %+v", projected.UserMessage)
+	}
+	parts := projected.UserMessage.Parts
+	if parts[0].Type != "text" || parts[1].Type != "image" || parts[1].Image == nil || parts[1].Image.AttachmentID != "ATTACH-VALID" || parts[2].Type != "image" || parts[2].Image != nil || parts[3].Text != "after" {
+		t.Fatalf("valid descriptor or invalid placeholder projection changed: %+v", parts)
+	}
+	if projected.Completeness == nil || !projected.Completeness.Incomplete || !strings.Contains(projected.Completeness.Reason, "invalid image attachment descriptor") {
+		t.Fatalf("invalid image descriptor was not marked incomplete: %+v", projected.Completeness)
+	}
+
+	live := conversationItem{
+		ItemID: "USER-1", Type: "user_message",
+		UserMessage: &conversationUserMessage{Parts: []conversationUserMessagePart{{
+			Type: "image", Image: &imageAttachmentDescriptor{AttachmentID: "ATTACH-VALID", Filename: "valid.png", MimeType: "image/png", SizeBytes: 7, SHA256: digest},
+		}}},
+	}
+	historyPlaceholder := conversationItem{
+		ItemID: "USER-1", Type: "user_message",
+		Completeness: &conversationCompleteness{Incomplete: true, Reason: "invalid image attachment descriptor"},
+		UserMessage:  &conversationUserMessage{Parts: []conversationUserMessagePart{{Type: "image"}}},
+	}
+	merged := mergeConversationItem(live, historyPlaceholder)
+	if merged.UserMessage == nil || len(merged.UserMessage.Parts) != 1 || merged.UserMessage.Parts[0].Image == nil || merged.UserMessage.Parts[0].Image.AttachmentID != "ATTACH-VALID" {
+		t.Fatalf("valid live descriptor did not enrich history placeholder: %+v", merged.UserMessage)
 	}
 }
 
@@ -1228,7 +1363,7 @@ func TestReadLoopEOFWakesPendingCallWithStableClosedError(t *testing.T) {
 	defer runCancel()
 	conn := &readAfterWriteConnection{wrote: make(chan struct{}), readErr: io.EOF}
 	client := &protocolClient{
-		conn: conn, hello: completeServerHello(2), requestIDPrefix: "test-connection",
+		conn: conn, hello: completeServerHello(0), requestIDPrefix: "test-connection",
 		ctx: runCtx, cancel: runCancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{},
 	}
 	go client.readLoop()
@@ -1294,7 +1429,7 @@ func TestNonClosingProtocolErrorIsNotNormalizedToClosed(t *testing.T) {
 	defer runCancel()
 	conn := &readAfterWriteConnection{wrote: make(chan struct{}), raw: []byte("not-json")}
 	client := &protocolClient{
-		conn: conn, hello: completeServerHello(2), requestIDPrefix: "test-connection",
+		conn: conn, hello: completeServerHello(0), requestIDPrefix: "test-connection",
 		ctx: runCtx, cancel: runCancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{},
 	}
 	go client.readLoop()
@@ -1376,7 +1511,7 @@ func TestCloseCancelsPongHoldingWriteGate(t *testing.T) {
 }
 
 func completeServerHello(patch uint32) *remotev1.ServerHello {
-	return &remotev1.ServerHello{ConnectionId: "conn", HostId: "HOST-1", HostRunId: "run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: patch}, Runtime: &remotev1.RuntimeInfo{}, Capabilities: &remotev1.Capabilities{}, HeartbeatIntervalMs: 1000, ConnectionTimeoutMs: 3000, MaxFrameBytes: 1 << 20}
+	return &remotev1.ServerHello{ConnectionId: "conn", HostId: "HOST-1", HostRunId: "run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 2, Patch: patch}, Runtime: &remotev1.RuntimeInfo{}, Capabilities: &remotev1.Capabilities{}, HeartbeatIntervalMs: 1000, ConnectionTimeoutMs: 3000, MaxFrameBytes: 1 << 20}
 }
 
 func readTestFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) *remotev1.Frame {

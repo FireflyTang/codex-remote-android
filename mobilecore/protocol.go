@@ -152,7 +152,7 @@ func dialProtocolWithRequestIDPrefix(ctx context.Context, cfg configPayload, dia
 	hello := &remotev1.ClientHello{
 		ClientId: cfg.ClientID, ClientRunId: cfg.ClientRunID,
 		ClientName: cfg.ClientName, ClientVersion: cfg.ClientVersion,
-		ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 2},
+		ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 2, Patch: 0},
 	}
 	if err := writeFrame(ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: hello}}); err != nil {
 		_ = conn.Close(websocket.StatusProtocolError, "ClientHello failed")
@@ -189,11 +189,14 @@ func validateServerHello(h *remotev1.ServerHello) error {
 		return fmt.Errorf("first Host frame is not a complete ServerHello")
 	}
 	v := h.ProtocolVersion
-	if v.Major != 1 || v.Minor != 1 || v.Patch != 2 {
+	if v.Major != 1 || v.Minor != 2 || v.Patch != 0 {
 		return fmt.Errorf("Host protocol is %d.%d.%d; require %s", v.Major, v.Minor, v.Patch, ProtocolVersion)
 	}
 	if h.HeartbeatIntervalMs == 0 || h.ConnectionTimeoutMs <= h.HeartbeatIntervalMs || h.MaxFrameBytes == 0 {
 		return fmt.Errorf("ServerHello has invalid heartbeat, timeout, or frame limits")
+	}
+	if _, _, err := imageAttachmentCapabilitiesFromProto(h.GetCapabilities().GetImageAttachments()); err != nil {
+		return err
 	}
 	return nil
 }
@@ -824,9 +827,24 @@ func (c *protocolClient) ListHistory(ctx context.Context, codexID string) (conve
 }
 
 func (c *protocolClient) StartTurn(ctx context.Context, commandID, codexID, text string, options *turnOptionsPayload) (string, error) {
+	return c.StartTurnParts(ctx, commandID, codexID, []turnInputPart{{Type: "text", Text: text}}, options)
+}
+
+func (c *protocolClient) StartTurnParts(ctx context.Context, commandID, codexID string, parts []turnInputPart, options *turnOptionsPayload) (string, error) {
+	input := make([]*remotev1.UserInputPart, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			input = append(input, &remotev1.UserInputPart{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: part.Text}}})
+		case "image":
+			input = append(input, &remotev1.UserInputPart{Content: &remotev1.UserInputPart_Image{Image: &remotev1.ImageInput{AttachmentId: part.AttachmentID}}})
+		default:
+			return "", fmt.Errorf("StartTurn has unsupported input part type %q", part.Type)
+		}
+	}
 	req := &remotev1.StartTurnRequest{
 		CodexId: codexID,
-		Input:   []*remotev1.UserInputPart{{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: text}}}},
+		Input:   input,
 	}
 	if options != nil {
 		req.Options = &remotev1.TurnOptions{Model: options.Model, Mode: options.Mode, ApprovalPolicy: options.ApprovalPolicy, ReasoningEffort: options.ReasoningEffort}
@@ -843,6 +861,100 @@ func (c *protocolClient) StartTurn(ctx context.Context, commandID, codexID, text
 		return "", fmt.Errorf("StartTurn returned mismatched response")
 	}
 	return result.TurnId, nil
+}
+
+func (c *protocolClient) ImageAttachmentSupport() (imageAttachmentCapabilities, bool, error) {
+	return imageAttachmentCapabilitiesFromProto(c.hello.GetCapabilities().GetImageAttachments())
+}
+
+func imageAttachmentCapabilitiesFromProto(capabilities *remotev1.ImageAttachmentCapabilities) (imageAttachmentCapabilities, bool, error) {
+	if capabilities == nil || !capabilities.Supported {
+		return imageAttachmentCapabilities{}, false, nil
+	}
+	if capabilities.MaxUploadBytes == 0 || capabilities.UnreferencedRetentionMs == 0 || len(capabilities.SupportedMimeTypes) == 0 {
+		return imageAttachmentCapabilities{}, false, fmt.Errorf("ServerHello has invalid image attachment capabilities")
+	}
+	mimeTypes := make([]string, len(capabilities.SupportedMimeTypes))
+	for i, mimeType := range capabilities.SupportedMimeTypes {
+		if !validImageMediaType(mimeType) {
+			return imageAttachmentCapabilities{}, false, fmt.Errorf("ServerHello has invalid image attachment MIME type")
+		}
+		mimeTypes[i] = mimeType
+	}
+	return imageAttachmentCapabilities{MaxUploadBytes: capabilities.MaxUploadBytes, SupportedMimeTypes: mimeTypes, UnreferencedRetentionMS: capabilities.UnreferencedRetentionMs}, true, nil
+}
+
+func (c *protocolClient) UploadImageAttachment(ctx context.Context, requestID string, p imageAttachmentUploadRequest) (imageAttachmentUploadResult, error) {
+	resp, err := c.callWithRequestID(ctx, requestID, &remotev1.Request{Request: &remotev1.Request_UploadImageAttachment{UploadImageAttachment: &remotev1.UploadImageAttachmentRequest{
+		CodexId: p.CodexID, Filename: p.Filename, MimeType: p.MimeType, Content: p.Content, Sha256: p.SHA256,
+	}}})
+	if err != nil {
+		return imageAttachmentUploadResult{}, fmt.Errorf("UploadImageAttachment: %w", err)
+	}
+	if resp.GetError() != nil {
+		return imageAttachmentUploadResult{}, imageAttachmentHostError("UploadImageAttachment", resp.GetError())
+	}
+	result := resp.GetUploadImageAttachment()
+	if result == nil {
+		return imageAttachmentUploadResult{}, newWorkspaceOperationError("operation_failed", "UploadImageAttachment returned mismatched response")
+	}
+	descriptor, err := imageAttachmentDescriptorFromProto(result.Attachment)
+	if err != nil || descriptor.Filename != p.Filename || descriptor.MimeType != p.MimeType || descriptor.SizeBytes != uint64(len(p.Content)) || descriptor.SHA256 != p.SHA256 {
+		return imageAttachmentUploadResult{}, newWorkspaceOperationError("operation_failed", "UploadImageAttachment returned mismatched descriptor")
+	}
+	return imageAttachmentUploadResult{Attachment: descriptor, Deduplicated: result.Deduplicated}, nil
+}
+
+func (c *protocolClient) DownloadImageAttachment(ctx context.Context, requestID, codexID, attachmentID string) (imageAttachmentDownloadResult, error) {
+	resp, err := c.callWithRequestID(ctx, requestID, &remotev1.Request{Request: &remotev1.Request_DownloadImageAttachment{DownloadImageAttachment: &remotev1.DownloadImageAttachmentRequest{CodexId: codexID, AttachmentId: attachmentID}}})
+	if err != nil {
+		return imageAttachmentDownloadResult{}, fmt.Errorf("DownloadImageAttachment: %w", err)
+	}
+	if resp.GetError() != nil {
+		return imageAttachmentDownloadResult{}, imageAttachmentHostError("DownloadImageAttachment", resp.GetError())
+	}
+	result := resp.GetDownloadImageAttachment()
+	if result == nil {
+		return imageAttachmentDownloadResult{}, newWorkspaceOperationError("operation_failed", "DownloadImageAttachment returned mismatched response")
+	}
+	descriptor, err := imageAttachmentDescriptorFromProto(result.Attachment)
+	if err != nil || descriptor.AttachmentID != attachmentID {
+		return imageAttachmentDownloadResult{}, newWorkspaceOperationError("operation_failed", "DownloadImageAttachment returned mismatched descriptor")
+	}
+	digest := sha256.Sum256(result.Content)
+	if descriptor.SizeBytes != uint64(len(result.Content)) || descriptor.SHA256 != fmt.Sprintf("%x", digest) {
+		return imageAttachmentDownloadResult{}, newWorkspaceOperationError("image_attachment_hash_mismatch", "DownloadImageAttachment content does not match descriptor")
+	}
+	return imageAttachmentDownloadResult{Attachment: descriptor, ContentBase64: base64.StdEncoding.EncodeToString(result.Content)}, nil
+}
+
+func imageAttachmentDescriptorFromProto(value *remotev1.ImageAttachment) (imageAttachmentDescriptor, error) {
+	if value == nil || strings.TrimSpace(value.AttachmentId) == "" || strings.TrimSpace(value.Filename) == "" || value.SizeBytes == 0 ||
+		!validImageMediaType(value.MimeType) ||
+		len(value.Sha256) != 64 || value.Sha256 != strings.ToLower(value.Sha256) || !isLowerHex(value.Sha256) || (value.WidthPixels == nil) != (value.HeightPixels == nil) {
+		return imageAttachmentDescriptor{}, fmt.Errorf("invalid image attachment descriptor")
+	}
+	if value.WidthPixels != nil && (*value.WidthPixels == 0 || *value.HeightPixels == 0) {
+		return imageAttachmentDescriptor{}, fmt.Errorf("invalid image attachment dimensions")
+	}
+	return imageAttachmentDescriptor{AttachmentID: value.AttachmentId, Filename: value.Filename, MimeType: value.MimeType, SizeBytes: value.SizeBytes, SHA256: value.Sha256, WidthPixels: value.WidthPixels, HeightPixels: value.HeightPixels}, nil
+}
+
+func isLowerHex(value string) bool {
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func imageAttachmentHostError(method string, hostErr *remotev1.Error) error {
+	code := strings.ToLower(strings.TrimPrefix(hostErr.Code.String(), "ERROR_CODE_"))
+	if code == "" || code == "unspecified" {
+		code = "operation_failed"
+	}
+	return newWorkspaceOperationError(code, fmt.Sprintf("%s Host error: %s", method, hostErr.Message))
 }
 
 func (c *protocolClient) InterruptTurn(ctx context.Context, codexID, turnID string) (string, error) {
@@ -1236,14 +1348,41 @@ func conversationItemFromProto(item *remotev1.Item) conversationItem {
 		if content.UserMessage == nil {
 			break
 		}
-		parts := []string{}
-		for _, input := range content.UserMessage.Input {
+		textParts := []string{}
+		parts := make([]conversationUserMessagePart, 0, len(content.UserMessage.Parts))
+		invalidImageDescriptor := false
+		for _, input := range content.UserMessage.Parts {
+			if input == nil {
+				continue
+			}
 			if text := input.GetText(); text != nil {
-				parts = append(parts, text.Text)
+				textParts = append(textParts, text.Text)
+				parts = append(parts, conversationUserMessagePart{Type: "text", Text: text.Text})
+				continue
+			}
+			if image := input.GetImage(); image != nil {
+				descriptor, err := imageAttachmentDescriptorFromProto(image)
+				if err != nil {
+					invalidImageDescriptor = true
+					parts = append(parts, conversationUserMessagePart{Type: "image"})
+					continue
+				}
+				parts = append(parts, conversationUserMessagePart{Type: "image", Image: &descriptor})
 			}
 		}
 		out.Type = "user_message"
-		out.UserMessage = &conversationUserMessage{TextParts: parts, Text: strings.Join(parts, "\n")}
+		out.UserMessage = &conversationUserMessage{Parts: parts, TextParts: textParts, Text: strings.Join(textParts, "\n")}
+		if invalidImageDescriptor {
+			if out.Completeness == nil {
+				out.Completeness = &conversationCompleteness{}
+			}
+			out.Completeness.Incomplete = true
+			if out.Completeness.Reason == "" {
+				out.Completeness.Reason = "invalid image attachment descriptor"
+			} else if !strings.Contains(out.Completeness.Reason, "invalid image attachment descriptor") {
+				out.Completeness.Reason += "; invalid image attachment descriptor"
+			}
+		}
 	case *remotev1.Item_AgentMessage:
 		if content.AgentMessage == nil {
 			break

@@ -451,7 +451,10 @@ func TestCoreConfigureStartRefreshStop(t *testing.T) {
 	}
 	waitPhase(t, c, "ready")
 	ready := decodeState(t, c.State())
-	if ready.Protocol.WireVersion != "1.1.2" || len(ready.TailnetIPs) != 1 {
+	if ready.Protocol.WireVersion != "1.2.0" ||
+		ready.Protocol.ModuleVersion != "v1.1.3-0.20260904143425-724b0b2543b0" ||
+		ready.Protocol.SchemaCommit != "724b0b2543b0e28a039576eff81312d8b75278f9" ||
+		len(ready.TailnetIPs) != 1 {
 		t.Fatalf("unexpected ready state: %+v", ready)
 	}
 

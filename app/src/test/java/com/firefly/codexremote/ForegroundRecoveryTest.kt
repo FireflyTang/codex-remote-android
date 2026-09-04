@@ -121,6 +121,7 @@ class ForegroundRecoveryTest {
             ready.copy(pendingWorkspaceDownloadCommandId = "download"),
             ready.copy(workspaceLocalTransferStatus = "copying"),
             ready.copy(submittingRequestIds = setOf("request")),
+            ready.copy(imageAttachmentBusy = true),
         )
 
         busyStates.forEach { state ->

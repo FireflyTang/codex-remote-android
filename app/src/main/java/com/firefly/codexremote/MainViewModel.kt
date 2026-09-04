@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.firefly.codexremote.mobilecore.Core
 import com.firefly.codexremote.mobilecore.Mobilecore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -18,6 +19,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -28,9 +31,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 data class AppUiState(
     val hostAddress: String = DefaultHostAddress,
+    val connectedHostAddress: String = "",
     val core: CoreState = CoreState(),
     val openCodexId: String? = null,
     val draft: String = "",
+    val draftImages: List<DraftImageAttachment> = emptyList(),
+    val imageAttachmentBusy: Boolean = false,
+    val imageAttachmentError: String = "",
+    val cachedImagePaths: Map<String, String> = emptyMap(),
+    val imagePreviewPath: String = "",
     val optimisticUserMessages: List<OptimisticUserMessage> = emptyList(),
     val stoppingTurn: Boolean = false,
     val lastProjectPath: String = "",
@@ -79,6 +88,8 @@ data class OptimisticUserMessage(
     val commandId: String,
     val codexId: String,
     val text: String,
+    val images: List<DraftImageAttachment> = emptyList(),
+    val imageScope: String = "",
     val acceptedTurnId: String = "",
     val createdAtUnixMs: Long = 0,
 )
@@ -129,6 +140,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val projectOperationSingleFlight = ProjectOperationSingleFlight()
     private val diagnosticActionTracker = DiagnosticActionTracker()
     private val codexDrafts = ConcurrentHashMap<String, String>()
+    private val filesDir = application.filesDir
+    private val codexDraftImages = ConcurrentHashMap<String, List<DraftImageAttachment>>().apply {
+        putAll(loadDraftImages(filesDir))
+    }
+    private val pendingSendImages = ConcurrentHashMap<String, List<DraftImageAttachment>>()
+    private val pendingSendImageScopes = ConcurrentHashMap<String, String>()
     private val codexDraftVersions = ConcurrentHashMap<String, Long>()
     private val attemptedPersistedSelections = ConcurrentHashMap.newKeySet<String>()
     private val forgetPersistenceTracker = ForgetPersistenceTracker()
@@ -152,7 +169,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             hostPreferences.hostAddress.collect { saved ->
-                _uiState.update { it.copy(hostAddress = saved) }
+                _uiState.update { current -> current.copy(hostAddress = saved) }
             }
         }
         viewModelScope.launch {
@@ -169,7 +186,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { current ->
                 val openCodexId = current.openCodexId
                 if (openCodexId == null || current.draft.isNotEmpty()) current
-                else current.copy(draft = draftForCodex(codexDrafts, openCodexId))
+                else current.copy(
+                    draft = draftForCodex(codexDrafts, openCodexId),
+                    draftImages = codexDraftImages[imageDraftScope(current.connectedHostAddress, openCodexId)].orEmpty(),
+                )
             }
             val forgottenCodexId = authoritativeForgottenCodex(
                 uiState.value,
@@ -184,7 +204,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setHostAddress(value: String) {
-        _uiState.update { it.copy(hostAddress = value) }
+        _uiState.update { current -> current.copy(hostAddress = value) }
         viewModelScope.launch { hostPreferences.setHostAddress(value) }
     }
 
@@ -207,6 +227,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val startingState = uiState.value
         val endpoint = startingState.hostAddress.trim()
         if (endpoint.isEmpty()) return
+        _uiState.update { current ->
+            current.copy(
+                connectedHostAddress = endpoint,
+                draftImages = current.openCodexId?.let {
+                    codexDraftImages[imageDraftScope(endpoint, it)].orEmpty()
+                }.orEmpty(),
+            )
+        }
         if (foregroundRecovery) {
             _uiState.update(::foregroundRecoveryStartingState)
         } else {
@@ -426,6 +454,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 openCodexId = if (managedProjectCommand == null) codexId else it.openCodexId,
                 draft = if (managedProjectCommand == null) draftForCodex(codexDrafts, codexId) else it.draft,
+                draftImages = if (managedProjectCommand == null) {
+                    codexDraftImages[imageDraftScope(it.connectedHostAddress, codexId)].orEmpty()
+                } else it.draftImages,
+                imageAttachmentBusy = false,
+                imageAttachmentError = "",
                 pendingProjectCommandId = managedProjectCommand?.getString("id") ?: it.pendingProjectCommandId,
                 pendingProjectCommandStage = if (managedProjectCommand != null) ProjectStageSelection else it.pendingProjectCommandStage,
                 pendingProjectAction = if (managedProjectCommand != null) "select_codex" else it.pendingProjectAction,
@@ -470,6 +503,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 openCodexId = null,
                 draft = "",
+                draftImages = emptyList(),
+                imageAttachmentBusy = false,
+                imageAttachmentError = "",
+                imagePreviewPath = "",
                 stoppingTurn = false,
                 conversationPage = ConversationPage.CONVERSATION,
                 workspaceEditorOpen = false,
@@ -779,13 +816,119 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun addDraftImage(image: DraftImageAttachment) {
+        val currentState = uiState.value
+        val codexId = currentState.openCodexId ?: return
+        val scope = imageDraftScope(currentState.connectedHostAddress, codexId)
+        if (image.codexId != codexId || image.scope != scope || currentState.imageAttachmentBusy ||
+            currentState.optimisticUserMessages.any {
+                it.codexId == codexId && it.imageScope == scope && it.acceptedTurnId.isBlank()
+            }
+        ) return
+        val updated = codexDraftImages[scope].orEmpty() + image
+        codexDraftImages[scope] = updated
+        persistDraftImages(filesDir, codexDraftImages)
+        _uiState.update { current ->
+            if (current.openCodexId == codexId) current.copy(draftImages = updated, imageAttachmentError = "") else current
+        }
+    }
+
+    fun removeDraftImage(localId: String) {
+        val codexId = uiState.value.openCodexId ?: return
+        val scope = imageDraftScope(uiState.value.connectedHostAddress, codexId)
+        if (uiState.value.imageAttachmentBusy) return
+        val previous = codexDraftImages[scope].orEmpty()
+        val removed = previous.firstOrNull { it.localId == localId } ?: return
+        val updated = previous.filterNot { it.localId == localId }
+        if (updated.isEmpty()) codexDraftImages.remove(scope) else codexDraftImages[scope] = updated
+        persistDraftImages(filesDir, codexDraftImages)
+        File(removed.localPath).delete()
+        File(removed.originalPath).delete()
+        _uiState.update { if (it.openCodexId == codexId) it.copy(draftImages = updated) else it }
+    }
+
+    fun setImageAttachmentError(message: String) {
+        _uiState.update { it.copy(imageAttachmentError = message) }
+    }
+
+    fun showImagePreview(path: String) {
+        if (File(path).isFile) _uiState.update { it.copy(imagePreviewPath = path) }
+    }
+
+    fun closeImagePreview() = _uiState.update { it.copy(imagePreviewPath = "") }
+
+    fun openHistoryImage(descriptor: ImageAttachmentDescriptor) {
+        val codexId = uiState.value.openCodexId ?: return
+        val cacheScope = imageCacheScope(uiState.value.connectedHostAddress, codexId)
+        val cacheKey = imageCacheKey(cacheScope, descriptor.attachmentId)
+        val cached = uiState.value.cachedImagePaths[cacheKey]
+            ?: existingCachedImage(filesDir, cacheScope, descriptor)?.absolutePath
+        if (cached != null && File(cached).isFile) {
+            showImagePreview(cached)
+            return
+        }
+        if (uiState.value.imageAttachmentBusy || descriptor.attachmentId.isBlank()) return
+        val command = coreCommand(
+            "download_image_attachment",
+            JSONObject().put("codexId", codexId).put("attachmentId", descriptor.attachmentId),
+        )
+        _uiState.update { it.copy(imageAttachmentBusy = true, imageAttachmentError = "") }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                if (!canDispatchUploadedImageTurn(uiState.value, codexId, cacheScope)) {
+                    throw CancellationException("会话已切换")
+                }
+                dispatchTracked(command, "image.download")
+                val commandId = command.getString("id")
+                val terminal = try {
+                    withTimeout(30_000) {
+                        uiState.first { state ->
+                            state.activeImageDraftScope() != cacheScope || state.openCodexId != codexId || state.core.selectedCodexId != codexId ||
+                                (state.openCodexId == codexId && state.core.selectedCodexId == codexId &&
+                                state.core.commandId == commandId && state.core.imageAttachments?.codexId == codexId &&
+                                state.core.imageAttachments.loading == "none")
+                        }
+                    }
+                } catch (_: TimeoutCancellationException) {
+                    throw ImageAttachmentException("图片下载超时，请重试")
+                }
+                if (terminal.activeImageDraftScope() != cacheScope || terminal.openCodexId != codexId || terminal.core.selectedCodexId != codexId) {
+                    throw CancellationException("会话已切换")
+                }
+                val attachmentState = terminal.core.imageAttachments
+                val result = attachmentState?.downloadResult
+                if (attachmentState?.error != null || result == null || result.attachment.attachmentId != descriptor.attachmentId) {
+                    throw ImageAttachmentException(attachmentState?.error?.message ?: "图片下载失败")
+                }
+                if (result.attachment != descriptor) throw ImageAttachmentException("下载图片信息不匹配")
+                val file = cacheDownloadedImage(filesDir, cacheScope, result)
+                _uiState.update {
+                    if (it.activeImageDraftScope() != cacheScope || it.core.selectedCodexId != codexId) it else it.copy(
+                        imageAttachmentBusy = false,
+                        cachedImagePaths = it.cachedImagePaths + (cacheKey to file.absolutePath),
+                        imagePreviewPath = file.absolutePath,
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _uiState.update {
+                    if (it.activeImageDraftScope() == cacheScope && it.core.selectedCodexId == codexId) {
+                        it.copy(imageAttachmentBusy = false, imageAttachmentError = error.message ?: "图片下载失败")
+                    } else it
+                }
+            }
+        }
+    }
+
     fun sendMessage() {
         val state = uiState.value
         val text = state.draft.trim()
-        if (!canDispatchMessage(state, text)) return
+        if (!canDispatchMessage(state, text, state.draftImages)) return
         val conversation = state.core.conversation ?: return
         val codexId = state.openCodexId ?: return
-        val command = coreCommand("start_turn", JSONObject().put("text", text))
+        val sendImageScope = imageDraftScope(state.connectedHostAddress, codexId)
+        val command = coreCommand("start_turn", JSONObject())
         flushPendingDraftWrite()
         sendDraftTracker.track(
             commandId = command.getString("id"),
@@ -793,23 +936,142 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             originalDraft = state.draft,
             draftVersion = codexDraftVersions[codexId] ?: 0L,
             knownTurnIds = conversation.turns.mapTo(mutableSetOf()) { it.turnId },
+            imageScope = sendImageScope,
         )
+        pendingSendImages[command.getString("id")] = state.draftImages
+        pendingSendImageScopes[command.getString("id")] = sendImageScope
         codexDrafts.remove(codexId)
         _uiState.update { current ->
             val optimisticMessage = OptimisticUserMessage(
                 commandId = command.getString("id"),
                 codexId = codexId,
                 text = text,
+                images = state.draftImages,
+                imageScope = sendImageScope,
                 createdAtUnixMs = System.currentTimeMillis(),
             )
             current.withOptimisticUserMessage(optimisticMessage).copy(
                 draft = "",
+                draftImages = emptyList(),
+                imageAttachmentBusy = state.draftImages.isNotEmpty(),
+                imageAttachmentError = "",
                 stoppingTurn = false,
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
-            dispatchTracked(command, "general")
+            try {
+                val cacheScope = pendingSendImageScopes[command.getString("id")]
+                    ?: imageCacheScope(state.connectedHostAddress, codexId)
+                val uploaded = state.draftImages.map { image -> uploadDraftImage(codexId, cacheScope, image) }
+                val stableImages = state.draftImages.zip(uploaded).map { (image, descriptor) ->
+                    val cached = existingCachedImage(filesDir, cacheScope, descriptor)
+                    image.copy(localPath = cached?.absolutePath ?: image.localPath)
+                }
+                _uiState.update { current ->
+                    val optimistic = current.optimisticUserMessages.map {
+                        if (it.commandId == command.getString("id")) it.copy(images = stableImages) else it
+                    }
+                    current.copy(
+                        optimisticUserMessages = optimistic,
+                        core = projectOptimisticUserMessages(current.core, optimistic, current.activeImageDraftScope()),
+                    )
+                }
+                if (!canDispatchUploadedImageTurn(uiState.value, codexId, sendImageScope)) {
+                    throw CancellationException("会话已切换")
+                }
+                val payload = buildStartTurnPayload(text, uploaded)
+                val startCommand = JSONObject(command.toString()).put("payload", payload)
+                _uiState.update { if (it.openCodexId == codexId) it.copy(imageAttachmentBusy = false) else it }
+                if (!canDispatchUploadedImageTurn(uiState.value, codexId, sendImageScope)) {
+                    throw CancellationException("会话已切换")
+                }
+                dispatchTracked(startCommand, "general")
+            } catch (error: CancellationException) {
+                if (error.message == "会话已切换") {
+                    val commandId = command.getString("id")
+                    sendDraftTracker.cancel(commandId)
+                    pendingSendImages.remove(commandId)
+                    pendingSendImageScopes.remove(commandId)
+                    codexDrafts[codexId] = state.draft
+                    _uiState.update { current ->
+                        val optimistic = current.optimisticUserMessages.filterNot { it.commandId == commandId }
+                        current.copy(
+                            optimisticUserMessages = optimistic,
+                            core = projectOptimisticUserMessages(current.core, optimistic, current.activeImageDraftScope()),
+                        )
+                    }
+                }
+                throw error
+            } catch (error: Exception) {
+                sendDraftTracker.cancel(command.getString("id"))
+                pendingSendImages.remove(command.getString("id"))
+                pendingSendImageScopes.remove(command.getString("id"))
+                codexDrafts[codexId] = state.draft
+                codexDraftImages[sendImageScope] = state.draftImages
+                persistDraftImages(filesDir, codexDraftImages)
+                _uiState.update { current ->
+                    current.copy(
+                        draft = if (current.activeImageDraftScope() == sendImageScope && current.draft.isEmpty()) state.draft else current.draft,
+                        draftImages = if (current.activeImageDraftScope() == sendImageScope) state.draftImages else current.draftImages,
+                        optimisticUserMessages = current.optimisticUserMessages.filterNot { it.commandId == command.getString("id") },
+                        core = projectOptimisticUserMessages(
+                            current.core,
+                            current.optimisticUserMessages.filterNot { it.commandId == command.getString("id") },
+                            current.activeImageDraftScope(),
+                        ),
+                        imageAttachmentBusy = if (current.activeImageDraftScope() == sendImageScope) false else current.imageAttachmentBusy,
+                        imageAttachmentError = if (current.activeImageDraftScope() == sendImageScope) error.message ?: "图片上传失败" else current.imageAttachmentError,
+                    )
+                }
+            }
         }
+    }
+
+    private suspend fun uploadDraftImage(
+        codexId: String,
+        cacheScope: String,
+        image: DraftImageAttachment,
+    ): ImageAttachmentDescriptor {
+        val bytes = File(image.localPath).readBytes()
+        if (bytes.size.toLong() != image.sizeBytes || sha256Hex(bytes) != image.sha256) {
+            throw ImageAttachmentException("本地图片校验失败")
+        }
+        val command = imageUploadCommand(codexId, image, bytes)
+        if (!canDispatchUploadedImageTurn(uiState.value, codexId, cacheScope)) {
+            throw CancellationException("会话已切换")
+        }
+        dispatchTracked(command, "image.upload")
+        val commandId = command.getString("id")
+        val terminalState = try {
+            withTimeout(30_000) {
+                    uiState.first { state ->
+                    state.activeImageDraftScope() != cacheScope || state.openCodexId != codexId || state.core.selectedCodexId != codexId ||
+                        (state.openCodexId == codexId && state.core.selectedCodexId == codexId &&
+                        state.core.commandId == commandId && state.core.imageAttachments?.codexId == codexId &&
+                        state.core.imageAttachments.loading == "none")
+                }
+            }
+        } catch (_: TimeoutCancellationException) {
+            throw ImageAttachmentException("图片上传超时，草稿已保留")
+        }
+        if (terminalState.activeImageDraftScope() != cacheScope || terminalState.openCodexId != codexId || terminalState.core.selectedCodexId != codexId) {
+            throw CancellationException("会话已切换")
+        }
+        val terminal = terminalState.core.imageAttachments
+        val result = terminal?.uploadResult
+        if (terminal?.error != null || result == null) {
+            throw ImageAttachmentException(terminal?.error?.message ?: "图片上传失败")
+        }
+        if (result.attachment.attachmentId.isBlank() || result.attachment.mimeType != image.mimeType ||
+            result.attachment.sizeBytes != image.sizeBytes || !result.attachment.sha256.equals(image.sha256, true)
+        ) throw ImageAttachmentException("服务端返回的图片信息不匹配")
+        cacheDownloadedImage(
+            filesDir,
+            cacheScope,
+            ImageAttachmentDownloadResult(result.attachment, Base64.getEncoder().encodeToString(bytes)),
+        )
+        archiveUploadedOriginal(filesDir, cacheScope, result.attachment, image)
+        return result.attachment
     }
 
     fun interruptTurn() {
@@ -981,15 +1243,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun clearForgottenCodex(codexId: String) {
         discardPendingDraftWrite(codexId)
-        sendDraftTracker.forgetCodex(codexId)
+        val forgottenImageScope = imageDraftScope(uiState.value.connectedHostAddress, codexId)
+        sendDraftTracker.forgetCodex(codexId, forgottenImageScope)
+        val forgottenSendIds = pendingSendImageScopes.filterValues { it == forgottenImageScope }.keys
+        forgottenSendIds.forEach {
+            pendingSendImages.remove(it)
+            pendingSendImageScopes.remove(it)
+        }
         codexDrafts.remove(codexId)
         codexDraftVersions.remove(codexId)
+        codexDraftImages.remove(forgottenImageScope)?.forEach {
+            File(it.localPath).delete()
+            File(it.originalPath).delete()
+        }
+        persistDraftImages(filesDir, codexDraftImages)
         if (persistedSelectedCodexId == codexId) persistedSelectedCodexId = null
         _uiState.update { current ->
-            val remaining = current.optimisticUserMessages.filterNot { it.codexId == codexId }
+            val remaining = current.optimisticUserMessages.filterNot {
+                it.codexId == codexId && it.imageScope == forgottenImageScope
+            }
             current.copy(
-                core = projectOptimisticUserMessages(current.core, remaining),
+                core = projectOptimisticUserMessages(current.core, remaining, current.activeImageDraftScope()),
                 optimisticUserMessages = remaining,
+                draftImages = if (current.openCodexId == null || current.openCodexId == codexId) {
+                    emptyList()
+                } else current.draftImages,
             )
         }
         if (uiState.value.openCodexId == codexId) closeConversation()
@@ -997,6 +1275,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun resolveSentDraft(resolution: SendDraftResolution) {
+        val sentImages = pendingSendImages.remove(resolution.commandId).orEmpty()
+        val imageScope = pendingSendImageScopes.remove(resolution.commandId).orEmpty()
+        val currentImages = codexDraftImages[imageScope].orEmpty()
+        val resolvedImages = draftImagesAfterSendResolution(currentImages, sentImages, resolution.accepted)
+        if (resolution.accepted && currentImages.isNotEmpty() && resolvedImages.isEmpty()) {
+            codexDraftImages.remove(imageScope)
+            sentImages.forEach {
+                File(it.localPath).delete()
+                File(it.originalPath).delete()
+            }
+            persistDraftImages(filesDir, codexDraftImages)
+            _uiState.update { current ->
+                if (current.activeImageDraftScope() == imageScope && current.draftImages == sentImages) {
+                    current.copy(draftImages = emptyList())
+                } else current
+            }
+        } else if (!resolution.accepted && sentImages.isNotEmpty()) {
+            _uiState.update { current ->
+                if (current.activeImageDraftScope() == imageScope && current.draftImages.isEmpty()) {
+                    current.copy(draftImages = sentImages)
+                } else current
+            }
+        }
         val latestVersion = codexDraftVersions[resolution.codexId] ?: 0L
         val persistedDraft = draftPersistenceAfterSendResolution(resolution, latestVersion) ?: return
         if (resolution.accepted) {
@@ -1027,7 +1328,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!attemptedPersistedSelections.add(codexId)) return
         _uiState.update { current ->
             if (current.openCodexId == null) {
-                current.copy(openCodexId = codexId, draft = draftForCodex(codexDrafts, codexId))
+                current.copy(
+                    openCodexId = codexId,
+                    draft = draftForCodex(codexDrafts, codexId),
+                    draftImages = codexDraftImages[imageDraftScope(current.connectedHostAddress, codexId)].orEmpty(),
+                )
             } else current
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -1058,7 +1363,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             forgetPersistenceTracker.onCoreState(decoded)
                 ?: authoritativeForgottenCodex(_uiState.value, persistedSelectedCodexId, decoded)
         } else null
-        val sentDraftResolution = if (revisionEligible) sendDraftTracker.onCoreState(decoded) else null
+        val sentDraftResolution = if (revisionEligible) {
+            sendDraftTracker.onCoreState(decoded, _uiState.value.activeImageDraftScope())
+        } else null
         if (revisionEligible) {
             coreStateDiagnosticRecorder.record(decoded)
             diagnosticActionTracker.consumeTerminal(decoded, _uiState.value)?.let { tracked ->
@@ -1169,7 +1476,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     sentDraftResolution,
                 )
                 var next = current.copy(
-                    core = projectOptimisticUserMessages(decoded, optimisticUserMessages),
+                    core = projectOptimisticUserMessages(
+                        decoded,
+                        optimisticUserMessages,
+                        nextOpenCodexId?.let { imageDraftScope(current.connectedHostAddress, it) }.orEmpty(),
+                    ),
                     optimisticUserMessages = optimisticUserMessages,
                     userInputDrafts = decodedActiveConversation?.let { conversation ->
                         current.userInputDrafts.filterKeys { requestId ->
@@ -1279,6 +1590,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         nextOpenCodexId != current.openCodexId -> draftForCodex(codexDrafts, nextOpenCodexId)
                         else -> current.draft
                     },
+                    draftImages = draftImagesForOpenCodexTransition(
+                        hostAddress = current.connectedHostAddress,
+                        currentOpenCodexId = current.openCodexId,
+                        nextOpenCodexId = nextOpenCodexId,
+                        currentImages = current.draftImages,
+                        drafts = codexDraftImages,
+                    ),
                     conversationPage = if (recoveryFinished) ConversationPage.CONVERSATION else current.conversationPage,
                     workspaceEditorOpen = when {
                         recoveryFailed != null -> false
@@ -1412,6 +1730,7 @@ internal class SendDraftTracker {
         val originalDraft: String,
         val draftVersion: Long,
         val knownTurnIds: Set<String>,
+        val imageScope: String,
     )
 
     private val pending = ConcurrentHashMap<String, PendingSend>()
@@ -1422,17 +1741,19 @@ internal class SendDraftTracker {
         originalDraft: String,
         draftVersion: Long,
         knownTurnIds: Set<String> = emptySet(),
+        imageScope: String = "",
     ) {
-        pending[commandId] = PendingSend(codexId, originalDraft, draftVersion, knownTurnIds)
+        pending[commandId] = PendingSend(codexId, originalDraft, draftVersion, knownTurnIds, imageScope)
     }
 
-    fun onCoreState(state: CoreState): SendDraftResolution? {
-        val current = pending[state.commandId]
+    fun onCoreState(state: CoreState, activeImageScope: String = ""): SendDraftResolution? {
+        fun PendingSend.inScope() = imageScope.isBlank() || imageScope == activeImageScope
+        val current = pending[state.commandId]?.takeIf { it.inScope() }
         val conversation = state.conversation
         val caused = conversation?.turns.orEmpty().mapNotNull { turn ->
             val commandId = turn.causedByCommandId
             val tracked = pending[commandId]
-            if (commandId.isNotBlank() && tracked != null && conversation?.codexId == tracked.codexId &&
+            if (commandId.isNotBlank() && tracked != null && tracked.inScope() && conversation?.codexId == tracked.codexId &&
                 turn.turnId.isNotBlank() && turn.turnId !in tracked.knownTurnIds
             ) Triple(commandId, tracked, turn.turnId) else null
         }
@@ -1493,8 +1814,14 @@ internal class SendDraftTracker {
         )
     }
 
-    fun forgetCodex(codexId: String) {
-        pending.entries.removeIf { it.value.codexId == codexId }
+    fun forgetCodex(codexId: String, imageScope: String = "") {
+        pending.entries.removeIf {
+            it.value.codexId == codexId && (imageScope.isBlank() || it.value.imageScope == imageScope)
+        }
+    }
+
+    fun cancel(commandId: String) {
+        pending.remove(commandId)
     }
 }
 
@@ -1527,21 +1854,47 @@ internal fun reconcileOptimisticUserMessages(
 internal fun AppUiState.withOptimisticUserMessage(message: OptimisticUserMessage): AppUiState {
     val optimistic = optimisticUserMessages.filterNot { it.commandId == message.commandId } + message
     return copy(
-        core = projectOptimisticUserMessages(core, optimistic),
+        core = projectOptimisticUserMessages(core, optimistic, activeImageDraftScope()),
         optimisticUserMessages = optimistic,
     )
 }
 
-internal fun canDispatchMessage(state: AppUiState, text: String): Boolean {
+internal fun canDispatchMessage(
+    state: AppUiState,
+    text: String,
+    images: List<DraftImageAttachment> = emptyList(),
+): Boolean {
     val codexId = state.openCodexId ?: return false
     val conversation = state.core.conversation ?: return false
-    return text.isNotBlank() && conversation.codexId == codexId && !conversation.running &&
-        state.optimisticUserMessages.none { it.codexId == codexId && it.acceptedTurnId.isBlank() }
+    return (text.isNotBlank() || images.isNotEmpty()) && conversation.codexId == codexId && !conversation.running &&
+        !state.imageAttachmentBusy && state.core.phase == "ready" &&
+        !state.hasUnresolvedSendInActiveImageScope()
 }
+
+internal fun AppUiState.activeImageDraftScope(): String = openCodexId?.let {
+    imageDraftScope(connectedHostAddress, it)
+}.orEmpty()
+
+internal fun AppUiState.hasUnresolvedSendInActiveImageScope(): Boolean {
+    val codexId = openCodexId ?: return false
+    val scope = activeImageDraftScope()
+    return optimisticUserMessages.any {
+        it.codexId == codexId && it.acceptedTurnId.isBlank() &&
+            (it.imageScope.isBlank() || it.imageScope == scope)
+    }
+}
+
+internal fun canDispatchUploadedImageTurn(
+    state: AppUiState,
+    codexId: String,
+    imageScope: String,
+): Boolean = state.openCodexId == codexId && state.core.selectedCodexId == codexId &&
+    state.activeImageDraftScope() == imageScope
 
 internal fun projectOptimisticUserMessages(
     core: CoreState,
     messages: List<OptimisticUserMessage>,
+    activeImageScope: String = "",
 ): CoreState {
     val conversation = core.conversation ?: return core
     val cleanedTurns = conversation.turns.mapNotNull { turn ->
@@ -1550,7 +1903,9 @@ internal fun projectOptimisticUserMessages(
         if (turn.turnId.startsWith(OptimisticTurnPrefix) && items.isEmpty() && legacyMessages.isEmpty()) null
         else turn.copy(items = items, messages = legacyMessages)
     }
-    val relevant = messages.filter { it.codexId == conversation.codexId }
+    val relevant = messages.filter {
+        it.codexId == conversation.codexId && (it.imageScope.isBlank() || it.imageScope == activeImageScope)
+    }
     if (relevant.isEmpty()) return core.copy(conversation = conversation.copy(turns = cleanedTurns))
 
     val useTypedItems = cleanedTurns.any { it.items.isNotEmpty() }
@@ -1563,7 +1918,14 @@ internal fun projectOptimisticUserMessages(
             turnId = turnId,
             type = "user_message",
             status = "started",
-            userMessage = UserMessageItem(listOf(message.text), message.text),
+            userMessage = UserMessageItem(
+                textParts = listOfNotNull(message.text.takeIf(String::isNotBlank)),
+                text = message.text,
+                parts = buildList {
+                    if (message.text.isNotBlank()) add(UserMessagePart(type = "text", text = message.text))
+                    message.images.forEach { add(UserMessagePart(type = "image", localPath = it.localPath)) }
+                },
+            ),
             provenance = "PROVENANCE_KIND_LIVE_WIRE",
         )
         val legacyMessage = ConversationMessage(itemId, "user", message.text, "started")
@@ -1608,9 +1970,50 @@ private fun coreHasAcceptedUserMessage(core: CoreState, message: OptimisticUserM
 
 private const val OptimisticTurnPrefix = "optimistic-turn-"
 private const val OptimisticUserItemPrefix = "optimistic-user-"
+internal fun buildStartTurnPayload(text: String, images: List<ImageAttachmentDescriptor>): JSONObject =
+    if (images.isEmpty()) {
+        JSONObject().put("text", text)
+    } else {
+        JSONObject().put("parts", JSONArray().apply {
+            if (text.isNotBlank()) put(JSONObject().put("type", "text").put("text", text))
+            images.forEach { put(JSONObject().put("type", "image").put("attachmentId", it.attachmentId)) }
+        })
+    }
+
+internal fun imageUploadCommand(codexId: String, image: DraftImageAttachment, bytes: ByteArray): JSONObject =
+    coreCommand(
+        "upload_image_attachment",
+        JSONObject().put("codexId", codexId).put("filename", image.filename)
+            .put("mimeType", image.mimeType)
+            .put("contentBase64", Base64.getEncoder().encodeToString(bytes)).put("sha256", image.sha256),
+    ).apply {
+        if (image.uploadCommandId.isNotBlank()) put("id", image.uploadCommandId)
+    }
+
+internal fun draftImagesAfterSendResolution(
+    current: List<DraftImageAttachment>,
+    sent: List<DraftImageAttachment>,
+    accepted: Boolean,
+): List<DraftImageAttachment> = when {
+    accepted && current == sent -> emptyList()
+    !accepted && current.isEmpty() -> sent
+    else -> current
+}
 
 internal fun draftForCodex(drafts: Map<String, String>, codexId: String?): String =
     codexId?.let(drafts::get).orEmpty()
+
+internal fun draftImagesForOpenCodexTransition(
+    hostAddress: String,
+    currentOpenCodexId: String?,
+    nextOpenCodexId: String?,
+    currentImages: List<DraftImageAttachment>,
+    drafts: Map<String, List<DraftImageAttachment>>,
+): List<DraftImageAttachment> = when {
+    nextOpenCodexId == null -> emptyList()
+    nextOpenCodexId != currentOpenCodexId -> drafts[imageDraftScope(hostAddress, nextOpenCodexId)].orEmpty()
+    else -> currentImages
+}
 
 internal fun persistedCodexToRestore(
     state: AppUiState,
@@ -2105,7 +2508,8 @@ private fun foregroundRecoveryBlocked(state: AppUiState): Boolean {
         state.pendingWorkspaceGetCommandId.isNotBlank() || state.pendingWorkspaceReadCommandId.isNotBlank() ||
         state.pendingWorkspaceUploadCommandId.isNotBlank() || state.pendingWorkspaceDownloadCommandId.isNotBlank() ||
         state.workspaceLocalTransferStatus != "none" || state.submittingRequestIds.isNotEmpty()
-    return state.foregroundRecoveryInProgress || conversation?.running == true || pendingInteraction || pendingUiOperation ||
+    return state.foregroundRecoveryInProgress || state.imageAttachmentBusy || conversation?.running == true ||
+        pendingInteraction || pendingUiOperation ||
         state.core.phase in ForegroundRecoveryBusyPhases
 }
 

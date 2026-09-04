@@ -133,7 +133,29 @@ data class ItemCompleteness(
     val reason: String = "",
 )
 
-data class UserMessageItem(val textParts: List<String>, val text: String)
+data class ImageAttachmentDescriptor(
+    val attachmentId: String = "",
+    val filename: String = "",
+    val mimeType: String = "",
+    val sizeBytes: Long = 0,
+    val sha256: String = "",
+    val widthPixels: Int? = null,
+    val heightPixels: Int? = null,
+)
+
+data class UserMessagePart(
+    val type: String,
+    val text: String = "",
+    val image: ImageAttachmentDescriptor? = null,
+    // App-only source for a draft/optimistic image. Never serialized to MobileCore.
+    val localPath: String = "",
+)
+
+data class UserMessageItem(
+    val textParts: List<String>,
+    val text: String,
+    val parts: List<UserMessagePart> = textParts.map { UserMessagePart(type = "text", text = it) },
+)
 data class AgentMessageItem(val text: String)
 data class ReasoningSummaryItem(val text: String)
 data class PlanStep(val text: String, val status: String)
@@ -292,6 +314,28 @@ data class CoreState(
     val selectedCodexId: String = "",
     val conversation: ConversationState? = null,
     val workspace: WorkspaceState? = null,
+    val imageAttachments: ImageAttachmentState? = null,
+)
+
+data class ImageAttachmentError(val code: String = "", val message: String = "")
+data class ImageAttachmentUploadResult(
+    val attachment: ImageAttachmentDescriptor = ImageAttachmentDescriptor(),
+    val deduplicated: Boolean = false,
+)
+data class ImageAttachmentDownloadResult(
+    val attachment: ImageAttachmentDescriptor = ImageAttachmentDescriptor(),
+    val contentBase64: String = "",
+)
+data class ImageAttachmentState(
+    val supported: Boolean = false,
+    val maxUploadBytes: Long = 0,
+    val supportedMimeTypes: List<String> = emptyList(),
+    val unreferencedRetentionMs: Long = 0,
+    val codexId: String = "",
+    val loading: String = "none",
+    val error: ImageAttachmentError? = null,
+    val uploadResult: ImageAttachmentUploadResult? = null,
+    val downloadResult: ImageAttachmentDownloadResult? = null,
 )
 
 fun decodeCoreState(raw: String): CoreState {
@@ -397,6 +441,7 @@ fun decodeCoreState(raw: String): CoreState {
         )
     }
     val workspace = root.optJSONObject("workspace")?.let(::decodeWorkspace)
+    val imageAttachments = root.optJSONObject("imageAttachments")?.let(::decodeImageAttachmentState)
     return CoreState(
         revision = root.optLong("revision"),
         commandId = root.optString("commandId"),
@@ -436,6 +481,7 @@ fun decodeCoreState(raw: String): CoreState {
         selectedCodexId = root.optString("selectedCodexId"),
         conversation = conversation,
         workspace = workspace,
+        imageAttachments = imageAttachments,
     )
 }
 
@@ -586,12 +632,28 @@ private fun decodeWorkspaceEntry(value: JSONObject) = WorkspaceEntry(
 private fun decodeConversationItem(item: JSONObject): ConversationItem {
     val completeness = decodeCompleteness(item.optJSONObject("completeness"))
     val user = item.optJSONObject("userMessage")?.let {
-        val parts = it.optJSONArray("textParts")
+        val textParts = it.optJSONArray("textParts")
+        val orderedParts = it.optJSONArray("parts")
         UserMessageItem(
             textParts = buildList {
-                if (parts != null) repeat(parts.length()) { index -> add(parts.optString(index)) }
+                if (textParts != null) repeat(textParts.length()) { index -> add(textParts.optString(index)) }
             },
             text = it.optString("text"),
+            parts = buildList {
+                if (orderedParts != null) repeat(orderedParts.length()) { index ->
+                    val part = orderedParts.optJSONObject(index) ?: return@repeat
+                    when (part.optString("type")) {
+                        "text" -> add(UserMessagePart(type = "text", text = part.optString("text")))
+                        "image" -> add(UserMessagePart(type = "image", image = part.optJSONObject("image")?.let(::decodeImageAttachmentDescriptor)))
+                    }
+                }
+            }.ifEmpty {
+                buildList {
+                    if (textParts != null) repeat(textParts.length()) { index ->
+                        add(UserMessagePart(type = "text", text = textParts.optString(index)))
+                    }
+                }
+            },
         )
     }
     val command = item.optJSONObject("command")?.let {
@@ -653,6 +715,45 @@ private fun decodeConversationItem(item: JSONObject): ConversationItem {
             ToolItem(it.optString("name"), it.optString("summary"), it.optString("resultSummary"))
         },
         fileChange = fileChange,
+    )
+}
+
+private fun decodeImageAttachmentDescriptor(value: JSONObject) = ImageAttachmentDescriptor(
+    attachmentId = value.optString("attachmentId"),
+    filename = value.optString("filename"),
+    mimeType = value.optString("mimeType"),
+    sizeBytes = value.optLong("sizeBytes"),
+    sha256 = value.optString("sha256"),
+    widthPixels = value.optInt("widthPixels").takeIf { value.has("widthPixels") },
+    heightPixels = value.optInt("heightPixels").takeIf { value.has("heightPixels") },
+)
+
+private fun decodeImageAttachmentState(value: JSONObject): ImageAttachmentState {
+    val mimeTypes = value.optJSONArray("supportedMimeTypes")
+    return ImageAttachmentState(
+        supported = value.optBoolean("supported"),
+        maxUploadBytes = value.optLong("maxUploadBytes"),
+        supportedMimeTypes = buildList {
+            if (mimeTypes != null) repeat(mimeTypes.length()) { add(mimeTypes.optString(it)) }
+        },
+        unreferencedRetentionMs = value.optLong("unreferencedRetentionMs"),
+        codexId = value.optString("codexId"),
+        loading = value.optString("loading", "none"),
+        error = value.optJSONObject("error")?.let {
+            ImageAttachmentError(it.optString("code"), it.optString("message"))
+        },
+        uploadResult = value.optJSONObject("uploadResult")?.let {
+            ImageAttachmentUploadResult(
+                attachment = decodeImageAttachmentDescriptor(it.optJSONObject("attachment") ?: JSONObject()),
+                deduplicated = it.optBoolean("deduplicated"),
+            )
+        },
+        downloadResult = value.optJSONObject("downloadResult")?.let {
+            ImageAttachmentDownloadResult(
+                attachment = decodeImageAttachmentDescriptor(it.optJSONObject("attachment") ?: JSONObject()),
+                contentBase64 = it.optString("contentBase64"),
+            )
+        },
     )
 }
 

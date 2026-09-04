@@ -3,7 +3,7 @@ module github.com/FireflyTang/codex-remote-android/mobilecore
 go 1.26.6
 
 require (
-	github.com/FireflyTang/codex-remote-protocol v1.1.2
+	github.com/FireflyTang/codex-remote-protocol v1.1.3-0.20260904143425-724b0b2543b0
 	github.com/coder/websocket v1.8.15
 	google.golang.org/protobuf v1.36.11
 	tailscale.com v1.102.3

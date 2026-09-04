@@ -4,10 +4,12 @@ package mobilecore
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"path"
 	"strings"
 	"sync"
@@ -16,9 +18,10 @@ import (
 
 const (
 	APIVersion            = 1
-	ProtocolVersion       = "1.1.2"
+	ProtocolVersion       = "1.2.0"
 	WebSocketSubprotocol  = "codex-remote.v1.protojson"
-	protocolModuleVersion = "v1.1.2"
+	protocolModuleVersion = "v1.1.3-0.20260904143425-724b0b2543b0"
+	protocolSchemaCommit  = "724b0b2543b0e28a039576eff81312d8b75278f9"
 )
 
 // Platform is implemented by Kotlin. It contains only the two Android
@@ -252,7 +255,73 @@ type turnOptionsPayload struct {
 
 type startTurnPayload struct {
 	Text    string              `json:"text"`
+	Parts   []turnInputPart     `json:"parts,omitempty"`
 	Options *turnOptionsPayload `json:"options,omitempty"`
+}
+
+type turnInputPart struct {
+	Type         string `json:"type"`
+	Text         string `json:"text,omitempty"`
+	AttachmentID string `json:"attachmentId,omitempty"`
+}
+
+type uploadImageAttachmentPayload struct {
+	CodexID       string `json:"codexId"`
+	Filename      string `json:"filename"`
+	MimeType      string `json:"mimeType"`
+	ContentBase64 string `json:"contentBase64"`
+	SHA256        string `json:"sha256"`
+}
+
+type downloadImageAttachmentPayload struct {
+	CodexID      string `json:"codexId"`
+	AttachmentID string `json:"attachmentId"`
+}
+
+type imageAttachmentDescriptor struct {
+	AttachmentID string  `json:"attachmentId"`
+	Filename     string  `json:"filename"`
+	MimeType     string  `json:"mimeType"`
+	SizeBytes    uint64  `json:"sizeBytes"`
+	SHA256       string  `json:"sha256"`
+	WidthPixels  *uint32 `json:"widthPixels,omitempty"`
+	HeightPixels *uint32 `json:"heightPixels,omitempty"`
+}
+
+type imageAttachmentCapabilities struct {
+	MaxUploadBytes          uint64   `json:"maxUploadBytes"`
+	SupportedMimeTypes      []string `json:"supportedMimeTypes"`
+	UnreferencedRetentionMS uint64   `json:"unreferencedRetentionMs"`
+}
+
+type imageAttachmentUploadRequest struct {
+	CodexID  string
+	Filename string
+	MimeType string
+	Content  []byte
+	SHA256   string
+}
+
+type imageAttachmentUploadResult struct {
+	Attachment   imageAttachmentDescriptor `json:"attachment"`
+	Deduplicated bool                      `json:"deduplicated"`
+}
+
+type imageAttachmentDownloadResult struct {
+	Attachment    imageAttachmentDescriptor `json:"attachment"`
+	ContentBase64 string                    `json:"contentBase64"`
+}
+
+type imageAttachmentState struct {
+	Supported               bool                           `json:"supported"`
+	MaxUploadBytes          uint64                         `json:"maxUploadBytes,omitempty"`
+	SupportedMimeTypes      []string                       `json:"supportedMimeTypes,omitempty"`
+	UnreferencedRetentionMS uint64                         `json:"unreferencedRetentionMs,omitempty"`
+	CodexID                 string                         `json:"codexId,omitempty"`
+	Loading                 string                         `json:"loading"`
+	Error                   *workspaceStateError           `json:"error,omitempty"`
+	UploadResult            *imageAttachmentUploadResult   `json:"uploadResult,omitempty"`
+	DownloadResult          *imageAttachmentDownloadResult `json:"downloadResult,omitempty"`
 }
 
 type interruptTurnPayload struct {
@@ -349,8 +418,15 @@ type conversationCompleteness struct {
 }
 
 type conversationUserMessage struct {
-	TextParts []string `json:"textParts"`
-	Text      string   `json:"text"`
+	Parts     []conversationUserMessagePart `json:"parts"`
+	TextParts []string                      `json:"textParts"`
+	Text      string                        `json:"text"`
+}
+
+type conversationUserMessagePart struct {
+	Type  string                     `json:"type"`
+	Text  string                     `json:"text,omitempty"`
+	Image *imageAttachmentDescriptor `json:"image,omitempty"`
 }
 
 type conversationAgentMessage struct {
@@ -444,6 +520,7 @@ type protocolState struct {
 	WireVersion   string `json:"wireVersion"`
 	Subprotocol   string `json:"subprotocol"`
 	ModuleVersion string `json:"moduleVersion"`
+	SchemaCommit  string `json:"schemaCommit"`
 }
 
 type state struct {
@@ -463,6 +540,7 @@ type state struct {
 	SelectedCodexID   string                  `json:"selectedCodexId,omitempty"`
 	Conversation      *conversationState      `json:"conversation,omitempty"`
 	Workspace         *workspaceState         `json:"workspace,omitempty"`
+	ImageAttachments  *imageAttachmentState   `json:"imageAttachments,omitempty"`
 	Protocol          protocolState           `json:"protocol"`
 }
 
@@ -479,6 +557,16 @@ type session interface {
 	UnmanageCodex(context.Context, string) error
 	ForgetCodex(context.Context, string) error
 	Close() error
+}
+
+type mixedTurnSession interface {
+	StartTurnParts(context.Context, string, string, []turnInputPart, *turnOptionsPayload) (string, error)
+}
+
+type imageAttachmentSession interface {
+	ImageAttachmentSupport() (imageAttachmentCapabilities, bool, error)
+	UploadImageAttachment(context.Context, string, imageAttachmentUploadRequest) (imageAttachmentUploadResult, error)
+	DownloadImageAttachment(context.Context, string, string, string) (imageAttachmentDownloadResult, error)
 }
 
 type starter interface {
@@ -574,6 +662,8 @@ type Core struct {
 	workspaceCancel             context.CancelFunc
 	workspaceRunID              uint64
 	workspaceUploadInFlight     bool
+	imageAttachmentCancel       context.CancelFunc
+	imageAttachmentRunID        uint64
 	pendingWatchCancel          context.CancelFunc
 	pendingWatchDone            chan struct{}
 	pendingWatchRunID           uint64
@@ -588,7 +678,7 @@ type Core struct {
 func NewCore(platform Platform) *Core {
 	c := &Core{platform: platform, starter: productionStarter{platform: platform}, conversationPollTimeout: 10 * time.Minute, pendingResponseCancels: map[string]context.CancelFunc{}, pendingRequestLocal: map[string]pendingLocalState{}, watchChunks: map[string]watchChunkState{}, notifier: &stateNotifier{platform: platform}}
 	c.state = state{Version: APIVersion, Phase: "idle", Protocol: protocolState{
-		WireVersion: ProtocolVersion, Subprotocol: WebSocketSubprotocol, ModuleVersion: protocolModuleVersion,
+		WireVersion: ProtocolVersion, Subprotocol: WebSocketSubprotocol, ModuleVersion: protocolModuleVersion, SchemaCommit: protocolSchemaCommit,
 	}}
 	return c
 }
@@ -744,6 +834,18 @@ func (c *Core) Dispatch(commandJSON string) string {
 			return c.workspaceReject(cmd.ID, p.CodexID, "invalid_request", "download_workspace_entry codexId is required")
 		}
 		return c.downloadWorkspaceEntry(cmd.ID, p)
+	case "upload_image_attachment":
+		var p uploadImageAttachmentPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return c.imageAttachmentReject(cmd.ID, "", "invalid_request", fmt.Sprintf("invalid upload_image_attachment payload: %v", err))
+		}
+		return c.uploadImageAttachment(cmd.ID, p)
+	case "download_image_attachment":
+		var p downloadImageAttachmentPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return c.imageAttachmentReject(cmd.ID, "", "invalid_request", fmt.Sprintf("invalid download_image_attachment payload: %v", err))
+		}
+		return c.downloadImageAttachment(cmd.ID, p)
 	case "select_codex":
 		var p selectCodexPayload
 		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
@@ -862,6 +964,7 @@ func (c *Core) finishStart(runID uint64, commandID string, sess session, snap sn
 		c.state.Phase, c.state.Error, c.state.AuthURL = "error", err.Error(), ""
 	} else {
 		c.session = sess
+		c.setImageAttachmentCapabilitiesLocked(sess)
 		c.applySnapshotLocked(commandID, snap)
 	}
 	c.publishLocked()
@@ -891,6 +994,7 @@ func (c *Core) refresh(commandID string) string {
 	c.interruptTurnID = ""
 	c.conversationPollTurnID = ""
 	c.clearConversationStartCommandsLocked()
+	c.cancelImageAttachmentLocked(c.state.SelectedCodexID)
 	sess := c.session
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	c.cancel = cancel
@@ -914,6 +1018,9 @@ func (c *Core) refresh(commandID string) string {
 		if err != nil {
 			c.state.Phase, c.state.Error = "error", err.Error()
 		} else {
+			if attachmentSession, ok := sess.(imageAttachmentSession); ok {
+				_ = c.syncImageAttachmentCapabilitiesLocked(attachmentSession)
+			}
 			c.applySnapshotLocked(commandID, snap)
 		}
 		c.publishLocked()
@@ -1242,6 +1349,232 @@ func (c *Core) downloadWorkspaceEntry(commandID string, p workspacePathPayload) 
 		})
 	}()
 	return out
+}
+
+func (c *Core) uploadImageAttachment(commandID string, p uploadImageAttachmentPayload) string {
+	content, decodeErr := decodeStrictBase64(p.ContentBase64)
+	c.mu.Lock()
+	if c.imageAttachmentCancel != nil {
+		out := c.imageAttachmentRejectLocked(commandID, p.CodexID, "image_attachment_busy", "an image attachment operation is in progress")
+		c.mu.Unlock()
+		return out
+	}
+	sess, err := c.imageAttachmentSessionLocked(p.CodexID)
+	if err == nil {
+		err = decodeErr
+	}
+	if err == nil {
+		err = validateImageAttachmentUpload(commandID, p, content, c.state.ImageAttachments)
+	}
+	if err != nil {
+		stateErr := imageAttachmentStateErrorFrom(err)
+		out := c.imageAttachmentRejectLocked(commandID, p.CodexID, stateErr.Code, stateErr.Message)
+		c.mu.Unlock()
+		return out
+	}
+	request := imageAttachmentUploadRequest{CodexID: p.CodexID, Filename: p.Filename, MimeType: p.MimeType, Content: content, SHA256: p.SHA256}
+	c.state.ImageAttachments.CodexID = p.CodexID
+	c.state.ImageAttachments.UploadResult = nil
+	out, ctx, runID := c.beginImageAttachmentLocked(commandID, "upload")
+	c.mu.Unlock()
+
+	go func() {
+		result, err := sess.UploadImageAttachment(ctx, commandID, request)
+		c.finishImageAttachmentOperation(runID, commandID, err, func(state *imageAttachmentState) {
+			state.UploadResult = &result
+		})
+	}()
+	return out
+}
+
+func (c *Core) downloadImageAttachment(commandID string, p downloadImageAttachmentPayload) string {
+	c.mu.Lock()
+	if c.imageAttachmentCancel != nil {
+		out := c.imageAttachmentRejectLocked(commandID, p.CodexID, "image_attachment_busy", "an image attachment operation is in progress")
+		c.mu.Unlock()
+		return out
+	}
+	sess, err := c.imageAttachmentSessionLocked(p.CodexID)
+	if err == nil && (strings.TrimSpace(p.AttachmentID) == "" || strings.TrimSpace(commandID) == "") {
+		err = errors.New("download_image_attachment command id, codexId, and attachmentId are required")
+	}
+	if err != nil {
+		stateErr := imageAttachmentStateErrorFrom(err)
+		out := c.imageAttachmentRejectLocked(commandID, p.CodexID, stateErr.Code, stateErr.Message)
+		c.mu.Unlock()
+		return out
+	}
+	c.state.ImageAttachments.CodexID = p.CodexID
+	c.state.ImageAttachments.DownloadResult = nil
+	out, ctx, runID := c.beginImageAttachmentLocked(commandID, "download")
+	c.mu.Unlock()
+
+	go func() {
+		result, err := sess.DownloadImageAttachment(ctx, commandID, p.CodexID, p.AttachmentID)
+		c.finishImageAttachmentOperation(runID, commandID, err, func(state *imageAttachmentState) {
+			state.DownloadResult = &result
+		})
+	}()
+	return out
+}
+
+func (c *Core) setImageAttachmentCapabilitiesLocked(sess session) {
+	attachmentSession, ok := sess.(imageAttachmentSession)
+	if !ok {
+		c.state.ImageAttachments = nil
+		return
+	}
+	_ = c.syncImageAttachmentCapabilitiesLocked(attachmentSession)
+}
+
+func (c *Core) imageAttachmentSessionLocked(codexID string) (imageAttachmentSession, error) {
+	if c.session == nil {
+		return nil, errors.New("core is not ready")
+	}
+	if strings.TrimSpace(codexID) == "" || c.state.SelectedCodexID != codexID {
+		return nil, errors.New("select_codex is required for this codexId")
+	}
+	sess, ok := c.session.(imageAttachmentSession)
+	if !ok {
+		return nil, newWorkspaceOperationError("capability_not_supported", "image attachment capability is not supported")
+	}
+	if err := c.syncImageAttachmentCapabilitiesLocked(sess); err != nil {
+		return nil, err
+	}
+	if !c.state.ImageAttachments.Supported {
+		return nil, newWorkspaceOperationError("capability_not_supported", "image attachment capability is not supported")
+	}
+	return sess, nil
+}
+
+func (c *Core) syncImageAttachmentCapabilitiesLocked(sess imageAttachmentSession) error {
+	capabilities, supported, err := sess.ImageAttachmentSupport()
+	if c.state.ImageAttachments == nil {
+		c.state.ImageAttachments = &imageAttachmentState{Loading: "none"}
+	}
+	state := c.state.ImageAttachments
+	state.Supported = supported
+	state.MaxUploadBytes = 0
+	state.SupportedMimeTypes = nil
+	state.UnreferencedRetentionMS = 0
+	if supported {
+		state.MaxUploadBytes = capabilities.MaxUploadBytes
+		state.SupportedMimeTypes = append([]string{}, capabilities.SupportedMimeTypes...)
+		state.UnreferencedRetentionMS = capabilities.UnreferencedRetentionMS
+	}
+	if err != nil {
+		state.Error = imageAttachmentStateErrorFrom(err)
+		return err
+	}
+	state.Error = nil
+	return nil
+}
+
+func validateImageAttachmentUpload(commandID string, p uploadImageAttachmentPayload, content []byte, state *imageAttachmentState) error {
+	if strings.TrimSpace(commandID) == "" || strings.TrimSpace(p.CodexID) == "" || strings.TrimSpace(p.Filename) == "" {
+		return errors.New("upload_image_attachment command id, codexId, and filename are required")
+	}
+	if !validImageMediaType(p.MimeType) {
+		return errors.New("upload_image_attachment mimeType must be a lowercase image media type without parameters")
+	}
+	if state == nil || uint64(len(content)) > state.MaxUploadBytes {
+		return newWorkspaceOperationError("image_attachment_too_large", "image attachment exceeds maxUploadBytes")
+	}
+	allowed := false
+	for _, mimeType := range state.SupportedMimeTypes {
+		if p.MimeType == mimeType {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return newWorkspaceOperationError("image_attachment_mime_type_unsupported", "image attachment mimeType is not supported")
+	}
+	digest := sha256.Sum256(content)
+	if len(p.SHA256) != 64 || p.SHA256 != fmt.Sprintf("%x", digest) {
+		return newWorkspaceOperationError("image_attachment_hash_mismatch", "image attachment sha256 does not match content")
+	}
+	return nil
+}
+
+func validImageMediaType(value string) bool {
+	mediaType, parameters, err := mime.ParseMediaType(value)
+	return err == nil && len(parameters) == 0 && mediaType == value && strings.HasPrefix(mediaType, "image/") && len(mediaType) > len("image/")
+}
+
+func (c *Core) beginImageAttachmentLocked(commandID, loading string) (string, context.Context, uint64) {
+	c.imageAttachmentRunID++
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	c.imageAttachmentCancel = cancel
+	c.state.CommandID = commandID
+	c.state.ImageAttachments.Loading = loading
+	c.state.ImageAttachments.Error = nil
+	return c.publishLocked(), ctx, c.imageAttachmentRunID
+}
+
+func (c *Core) finishImageAttachmentOperation(runID uint64, commandID string, operationErr error, apply func(*imageAttachmentState)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session == nil || c.imageAttachmentCancel == nil || c.imageAttachmentRunID != runID || c.state.ImageAttachments == nil {
+		return
+	}
+	c.imageAttachmentCancel()
+	c.imageAttachmentCancel = nil
+	c.state.CommandID = commandID
+	c.state.ImageAttachments.Loading = "none"
+	if operationErr != nil {
+		c.state.ImageAttachments.Error = imageAttachmentStateErrorFrom(operationErr)
+	} else {
+		apply(c.state.ImageAttachments)
+		c.state.ImageAttachments.Error = nil
+	}
+	c.publishLocked()
+}
+
+// cancelImageAttachmentLocked makes an in-flight completion stale before a
+// refresh or selection can publish newer state. Results are scoped to the
+// selected Codex, so the transition also clears both result slots and errors.
+func (c *Core) cancelImageAttachmentLocked(codexID string) {
+	if c.imageAttachmentCancel != nil {
+		c.imageAttachmentCancel()
+		c.imageAttachmentCancel = nil
+	}
+	c.imageAttachmentRunID++
+	if c.state.ImageAttachments == nil {
+		return
+	}
+	c.state.ImageAttachments.CodexID = codexID
+	c.state.ImageAttachments.Loading = "none"
+	c.state.ImageAttachments.Error = nil
+	c.state.ImageAttachments.UploadResult = nil
+	c.state.ImageAttachments.DownloadResult = nil
+}
+
+func (c *Core) imageAttachmentReject(commandID, codexID, code, message string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.imageAttachmentRejectLocked(commandID, codexID, code, message)
+}
+
+func (c *Core) imageAttachmentRejectLocked(commandID, codexID, code, message string) string {
+	if c.state.ImageAttachments == nil {
+		c.state.ImageAttachments = &imageAttachmentState{Loading: "none"}
+	}
+	c.state.CommandID = commandID
+	c.state.ImageAttachments.CodexID = codexID
+	c.state.ImageAttachments.Error = &workspaceStateError{Code: code, Message: message}
+	return c.publishLocked()
+}
+
+func imageAttachmentStateErrorFrom(err error) *workspaceStateError {
+	if err == nil {
+		return nil
+	}
+	var operationErr *workspaceOperationError
+	if errors.As(err, &operationErr) {
+		return &workspaceStateError{Code: operationErr.Code, Message: operationErr.Message}
+	}
+	return &workspaceStateError{Code: "operation_failed", Message: err.Error()}
 }
 
 func (c *Core) workspaceSessionLocked(codexID string) (workspaceSession, error) {
@@ -1744,6 +2077,7 @@ func (c *Core) selectCodex(commandID, codexID string) string {
 	}
 	c.interruptTurnID = ""
 	c.clearConversationStartCommandsLocked()
+	c.cancelImageAttachmentLocked(codexID)
 	c.conversationRunID++
 	previousWatchDone := c.cancelPendingLocked()
 	c.pendingWatchRunID++
@@ -1816,15 +2150,16 @@ func (c *Core) fetchConversation(ctx context.Context, cancel context.CancelFunc,
 }
 
 func (c *Core) startTurn(commandID string, p startTurnPayload) string {
-	if strings.TrimSpace(p.Text) == "" {
-		return c.reject(commandID, errors.New("start_turn text is required"))
+	parts, explicitParts, err := normalizeTurnInput(p)
+	if err != nil {
+		return c.reject(commandID, err)
 	}
 	c.mu.Lock()
 	if c.session == nil || c.cancel != nil || c.state.SelectedCodexID == "" {
 		c.mu.Unlock()
 		return c.reject(commandID, errors.New("select_codex is required before start_turn"))
 	}
-	if c.pollCancel != nil || (c.state.Conversation != nil && c.state.Conversation.Running) {
+	if c.pollCancel != nil || c.imageAttachmentCancel != nil || (c.state.Conversation != nil && c.state.Conversation.Running) {
 		c.mu.Unlock()
 		return c.reject(commandID, errors.New("a turn is already running"))
 	}
@@ -1842,7 +2177,18 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 
 	go func() {
 		callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second)
-		turnID, err := sess.StartTurn(callCtx, commandID, codexID, p.Text, p.Options)
+		var turnID string
+		var err error
+		if explicitParts {
+			mixed, ok := sess.(mixedTurnSession)
+			if !ok {
+				err = errors.New("image or mixed-part start_turn is not supported by this session")
+			} else {
+				turnID, err = mixed.StartTurnParts(callCtx, commandID, codexID, parts, p.Options)
+			}
+		} else {
+			turnID, err = sess.StartTurn(callCtx, commandID, codexID, p.Text, p.Options)
+		}
 		callCancel()
 		if err != nil {
 			c.mu.Lock()
@@ -1892,6 +2238,36 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 		c.pollConversation(ctx, sess, conversationRunID, commandID, codexID, turnID)
 	}()
 	return out
+}
+
+func normalizeTurnInput(p startTurnPayload) ([]turnInputPart, bool, error) {
+	if len(p.Parts) == 0 {
+		if strings.TrimSpace(p.Text) == "" {
+			return nil, false, errors.New("start_turn text or parts is required")
+		}
+		return []turnInputPart{{Type: "text", Text: p.Text}}, false, nil
+	}
+	if p.Text != "" {
+		return nil, true, errors.New("start_turn text and parts are mutually exclusive")
+	}
+	parts := make([]turnInputPart, len(p.Parts))
+	for i, part := range p.Parts {
+		part.Type = strings.ToLower(strings.TrimSpace(part.Type))
+		switch part.Type {
+		case "text":
+			if part.Text == "" || part.AttachmentID != "" {
+				return nil, true, fmt.Errorf("start_turn parts[%d] has invalid text content", i)
+			}
+		case "image":
+			if strings.TrimSpace(part.AttachmentID) == "" || part.Text != "" {
+				return nil, true, fmt.Errorf("start_turn parts[%d] has invalid image content", i)
+			}
+		default:
+			return nil, true, fmt.Errorf("start_turn parts[%d] has unsupported type %q", i, part.Type)
+		}
+		parts[i] = part
+	}
+	return parts, true, nil
 }
 
 func (c *Core) interruptTurn(commandID, turnID string) string {
@@ -2264,6 +2640,7 @@ func (c *Core) stop(commandID string) string {
 		c.workspaceCancel()
 		c.workspaceCancel = nil
 	}
+	c.cancelImageAttachmentLocked("")
 	c.workspaceUploadInFlight = false
 	c.conversationRunID++
 	c.workspaceRunID++
@@ -2273,7 +2650,7 @@ func (c *Core) stop(commandID string) string {
 	c.state.CommandID, c.state.Phase, c.state.AuthURL = commandID, "stopped", ""
 	c.state.ServerHello, c.state.Host, c.state.Codexes, c.state.TailnetIPs = nil, nil, nil, nil
 	c.state.DirectoryListing, c.state.SessionCandidates = nil, nil
-	c.state.SelectedCodexID, c.state.Conversation, c.state.Workspace = "", nil, nil
+	c.state.SelectedCodexID, c.state.Conversation, c.state.Workspace, c.state.ImageAttachments = "", nil, nil, nil
 	out := c.publishLocked()
 	c.mu.Unlock()
 	if sess != nil {

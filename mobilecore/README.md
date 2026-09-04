@@ -6,9 +6,13 @@ JSON state from both the return value and `Platform.OnState`.
 
 Pinned dependencies:
 
-- `github.com/FireflyTang/codex-remote-protocol v1.1.2`
-  (`f4e147fd6aba4571f2753d8d1864a4ab936b0db9`, wire `1.1.2`, WebSocket
-  subprotocol `codex-remote.v1.protojson`)
+- `github.com/FireflyTang/codex-remote-protocol v1.1.3-0.20260904143425-724b0b2543b0`
+  (wire `1.2.0`, schema commit
+  `724b0b2543b0e28a039576eff81312d8b75278f9`, WebSocket subprotocol
+  `codex-remote.v1.protojson`). The immutable pseudo-version pins the corrected
+  schema independently of the previously published `v1.2.0` tag and proxy
+  caches; it is based on the commit's `v1.1.2` ancestry while the wire protocol
+  remains exactly `1.2.0`.
 - `tailscale.com v1.102.3`
 - AAR tool: `golang/mobile` commit
   `4776eadac327bcb80cebc7413c91f8b4abf8ffa1`, with `x/tools v0.49.0`,
@@ -58,6 +62,9 @@ bind traffic to the physical network:
 {"version":1,"id":"write-1","type":"write_workspace_text_file","payload":{"codexId":"CODEX-1","relativePath":"README.md","utf8Text":"updated","condition":"replace_only","expectedRevision":"opaque-revision","expectedQuiescenceToken":"opaque-quiescence-token"}}
 {"version":1,"id":"upload-1","type":"upload_workspace_entry","payload":{"codexId":"CODEX-1","destinationPath":"assets/logo.bin","kind":"regular_file","contentBase64":"YWJj","expectedQuiescenceToken":"opaque-quiescence-token"}}
 {"version":1,"id":"download-1","type":"download_workspace_entry","payload":{"codexId":"CODEX-1","relativePath":"assets"}}
+{"version":1,"id":"image-upload-stable-1","type":"upload_image_attachment","payload":{"codexId":"CODEX-1","filename":"photo.png","mimeType":"image/png","contentBase64":"aW1hZ2U=","sha256":"6105d6cc76af400325e94d588ce511be5bfdbb73b437dc51eca43917d7a43e3d"}}
+{"version":1,"id":"image-download-1","type":"download_image_attachment","payload":{"codexId":"CODEX-1","attachmentId":"ATTACHMENT-1"}}
+{"version":1,"id":"turn-mixed-1","type":"start_turn","payload":{"parts":[{"type":"text","text":"Describe "},{"type":"image","attachmentId":"ATTACHMENT-1"},{"type":"text","text":" precisely."}]}}
 {"version":1,"id":"stop-1","type":"stop"}
 ```
 
@@ -84,7 +91,8 @@ Every item has `itemId`, optional `turnId`, `type`, and `status`, plus optional
 `completeness` (`truncated`, `incomplete`, `originalSizeBytes`, `reason`). Known
 types and their payloads are:
 
-- `user_message`: `userMessage.textParts` and their newline-joined `text`
+- `user_message`: ordered `userMessage.parts` (`text` or full immutable image
+  descriptor), plus compatibility `textParts` and their newline-joined `text`
 - `agent_message`: `agentMessage.text`
 - `reasoning_summary`: `reasoningSummary.text`
 - `plan`: `plan.steps[]` with `text` and protocol-defined string `status`
@@ -160,6 +168,24 @@ workspace root) and returns
 `maxInlineDownloadBytes`. The two operations use `loading="upload"` or
 `loading="download"` and do not replace `currentDirectory`, `openFile`, or
 conversation state.
+
+## Image attachments
+
+`imageAttachments` exposes the v1.2 Host capability, upload limits and MIME
+types, operation `loading`/`error`, and the latest upload or download result.
+Uploads require canonical standard Base64, a supported lowercase `image/*`
+MIME type, the raw-byte SHA-256 as 64 lowercase hex digits, and a stable command
+ID. Retrying an uncertain upload must resend the identical command ID and
+payload; the Core preserves that ID as the wire `request_id` across reconnect.
+Downloads verify returned bytes against the descriptor size and SHA-256 before
+publishing `contentBase64`.
+
+Legacy `start_turn.payload.text` remains supported. New callers may instead
+provide a non-empty ordered `parts` array containing `{type:"text",text}` and
+`{type:"image",attachmentId}` entries. The two input forms are mutually
+exclusive. History and realtime user-message items expose the same mixed order,
+with image parts carrying the complete descriptor including optional paired
+pixel dimensions.
 
 ## Verification
 

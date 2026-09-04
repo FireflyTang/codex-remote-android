@@ -8,14 +8,22 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.content.MediaType
+import androidx.compose.foundation.content.ReceiveContentListener
+import androidx.compose.foundation.content.consume
+import androidx.compose.foundation.content.contentReceiver
+import androidx.compose.foundation.content.hasMediaType
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -41,6 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
@@ -57,9 +66,12 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.Dialog
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -91,6 +103,40 @@ class MainActivity : ComponentActivity() {
             val documentIo = remember(context) { AndroidDocumentIo(context.contentResolver) }
             val diagnosticExporter = remember(context) { DiagnosticExporter(context.applicationContext) }
             val scope = rememberCoroutineScope()
+            fun importImage(uri: Uri): Boolean {
+                val codexId = state.openCodexId
+                val capability = state.core.imageAttachments
+                if (codexId == null || capability?.supported != true) {
+                    viewModel.setImageAttachmentError("当前会话暂不支持图片附件")
+                    return false
+                }
+                val conversation = state.core.conversation?.takeIf { it.codexId == codexId }
+                val unresolvedSend = state.hasUnresolvedSendInActiveImageScope()
+                if (conversation == null || conversation.running || state.imageAttachmentBusy || unresolvedSend ||
+                    state.core.phase in BusyPhases
+                ) {
+                    viewModel.setImageAttachmentError("当前正在处理消息，请稍后再添加图片")
+                    return false
+                }
+                return try {
+                    val image = importImageAttachment(
+                        context.contentResolver,
+                        context.filesDir,
+                        uri,
+                        codexId,
+                        state.connectedHostAddress,
+                        ImageImportLimits(capability.maxUploadBytes, capability.supportedMimeTypes.toSet()),
+                    )
+                    viewModel.addDraftImage(image)
+                    true
+                } catch (error: Exception) {
+                    viewModel.setImageAttachmentError(error.message ?: "图片导入失败，请重试")
+                    false
+                }
+            }
+            val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+                if (uri != null) importImage(uri)
+            }
             var downloadTargetDocumentId by rememberSaveable { mutableStateOf("") }
             var downloadTargetPath by rememberSaveable { mutableStateOf("") }
             var downloadTargetCommandId by rememberSaveable { mutableStateOf("") }
@@ -230,6 +276,16 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     },
+                    {
+                        pickImage.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                        )
+                    },
+                    ::importImage,
+                    viewModel::removeDraftImage,
+                    viewModel::showImagePreview,
+                    viewModel::closeImagePreview,
+                    viewModel::openHistoryImage,
                 )
             }
         }
@@ -292,6 +348,12 @@ fun CodexRemoteScreen(
     onUserInputFreeFormChanged: (String, String, String) -> Unit = { _, _, _ -> },
     onSubmitUserInput: (String) -> Unit = {},
     onExportDiagnostics: () -> Unit = {},
+    onChooseImage: () -> Unit = {},
+    onImportImageUri: (Uri) -> Boolean = { false },
+    onRemoveDraftImage: (String) -> Unit = {},
+    onShowImagePreview: (String) -> Unit = {},
+    onCloseImagePreview: () -> Unit = {},
+    onOpenHistoryImage: (ImageAttachmentDescriptor) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val displayState = when {
@@ -313,7 +375,8 @@ fun CodexRemoteScreen(
                 onWorkspaceEditorChanged, onSaveWorkspaceFile, onCloseWorkspaceEditor,
                 onChooseWorkspaceUpload, onChooseWorkspaceDownload,
                 onRespondApproval, onToggleUserInputOption, onUserInputFreeFormChanged,
-                onSubmitUserInput, onExportDiagnostics,
+                onSubmitUserInput, onExportDiagnostics, onChooseImage, onImportImageUri,
+                onRemoveDraftImage, onShowImagePreview, onOpenHistoryImage,
             )
         } else {
             HomeScreen(
@@ -345,6 +408,9 @@ fun CodexRemoteScreen(
                     },
                 )
             }
+        }
+        displayState.imagePreviewPath.takeIf { it.isNotBlank() }?.let { path ->
+            ImagePreviewDialog(path, onCloseImagePreview)
         }
     }
 }
@@ -791,6 +857,7 @@ private fun SessionCandidateRow(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ConversationScreen(
     title: String,
@@ -813,6 +880,11 @@ private fun ConversationScreen(
     onUserInputFreeFormChanged: (String, String, String) -> Unit,
     onSubmitUserInput: (String) -> Unit,
     onExportDiagnostics: () -> Unit,
+    onChooseImage: () -> Unit,
+    onImportImageUri: (Uri) -> Boolean,
+    onRemoveDraftImage: (String) -> Unit,
+    onShowImagePreview: (String) -> Unit,
+    onOpenHistoryImage: (ImageAttachmentDescriptor) -> Unit,
 ) {
     var drag by remember { mutableFloatStateOf(0f) }
     var selectedPage by rememberSaveable(state.openCodexId) {
@@ -836,6 +908,26 @@ private fun ConversationScreen(
     }
     val core = state.core
     val conversation = activeConversation(state)
+    val unresolvedSend = state.hasUnresolvedSendInActiveImageScope()
+    val composerBusy = state.imageAttachmentBusy || unresolvedSend
+    val canAttachImage = conversation != null && conversation.running != true && !composerBusy &&
+        core.imageAttachments?.supported == true && core.phase !in BusyPhases
+    val currentCanAttachImage by rememberUpdatedState(canAttachImage)
+    val currentImportImageUri by rememberUpdatedState(onImportImageUri)
+    val receiveImageContent = remember {
+        ReceiveContentListener { content ->
+            if (!currentCanAttachImage || !content.hasMediaType(MediaType.Image)) {
+                content
+            } else {
+                content.consume { item ->
+                    item.uri?.let { uri ->
+                        currentImportImageUri(uri)
+                        true
+                    } ?: false
+                }
+            }
+        }
+    }
     Column(
         Modifier.fillMaxSize().imePadding().testTag("conversation-root")
             .pointerInput(selectedPage, onBack) {
@@ -935,7 +1027,14 @@ private fun ConversationScreen(
                         style = MaterialTheme.typography.labelMedium,
                     )
                 }
-                ConversationHistory(core, state.openCodexId, Modifier.weight(1f).fillMaxWidth())
+                ConversationHistory(
+                    core,
+                    state.openCodexId,
+                    Modifier.weight(1f).fillMaxWidth(),
+                    state.imageAttachmentBusy,
+                    onShowImagePreview,
+                    onOpenHistoryImage,
+                )
                 PendingRequestsPanel(
                     conversation = conversation,
                     drafts = state.userInputDrafts,
@@ -953,39 +1052,71 @@ private fun ConversationScreen(
                     color = CodexColors.Composer,
                     border = BorderStroke(1.dp, CodexColors.Border),
                 ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(start = 18.dp, end = 5.dp, top = 4.dp, bottom = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    Column(
+                        Modifier.fillMaxWidth().padding(start = 12.dp, end = 5.dp, top = 7.dp, bottom = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                    BasicTextField(
-                        value = state.draft,
-                        onValueChange = onDraftChanged,
-                        modifier = Modifier.weight(1f).heightIn(min = 44.dp, max = 120.dp)
-                            .testTag("conversation-input").semantics { contentDescription = "消息输入框" },
-                        enabled = conversation?.running != true,
-                        textStyle = MaterialTheme.typography.bodyLarge.copy(color = CodexColors.Text),
-                        cursorBrush = SolidColor(CodexColors.Indigo),
-                        minLines = 1,
-                        maxLines = 5,
-                        decorationBox = { inner ->
-                            Box(Modifier.fillMaxWidth().heightIn(min = 44.dp), contentAlignment = Alignment.CenterStart) {
-                                if (state.draft.isBlank()) Text("输入消息", color = CodexColors.TextMuted)
-                                inner()
+                        if (state.draftImages.isNotEmpty()) {
+                            DraftImageStrip(
+                                state.draftImages,
+                                composerBusy,
+                                onShowImagePreview,
+                                onRemoveDraftImage,
+                            )
+                        }
+                        state.imageAttachmentError.takeIf { it.isNotBlank() }?.let { error ->
+                            Text(
+                                error,
+                                Modifier.padding(horizontal = 6.dp).testTag("image-attachment-error"),
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            IconButton(
+                                onChooseImage,
+                                Modifier.testTag("conversation-add-image")
+                                    .semantics { contentDescription = "添加图片" },
+                                enabled = canAttachImage,
+                            ) {
+                                Icon(Icons.Rounded.AddPhotoAlternate, "添加图片")
                             }
-                        },
-                    )
-                    if (conversation?.running == true) {
-                        FilledIconButton(
-                            onStop, Modifier.size(50.dp).testTag("conversation-stop").semantics { contentDescription = "停止任务" },
-                            enabled = !state.stoppingTurn,
-                        ) { Icon(Icons.Rounded.Stop, if (state.stoppingTurn) "停止中" else "停止") }
-                    } else {
-                        FilledIconButton(
-                            onSend, Modifier.size(50.dp).testTag("conversation-send").semantics { contentDescription = "发送消息" },
-                            enabled = state.draft.isNotBlank() && conversation != null && core.phase !in BusyPhases,
-                        ) { Icon(Icons.AutoMirrored.Outlined.Send, "发送") }
-                    }
+                            BasicTextField(
+                                value = state.draft,
+                                onValueChange = onDraftChanged,
+                                modifier = Modifier.weight(1f).heightIn(min = 44.dp, max = 120.dp)
+                                    .contentReceiver(receiveImageContent)
+                                    .testTag("conversation-input").semantics { contentDescription = "消息输入框" },
+                                enabled = conversation?.running != true && !composerBusy,
+                                textStyle = MaterialTheme.typography.bodyLarge.copy(color = CodexColors.Text),
+                                cursorBrush = SolidColor(CodexColors.Indigo),
+                                minLines = 1,
+                                maxLines = 5,
+                                decorationBox = { inner ->
+                                    Box(Modifier.fillMaxWidth().heightIn(min = 44.dp), contentAlignment = Alignment.CenterStart) {
+                                        if (state.draft.isBlank()) Text("输入消息或粘贴图片", color = CodexColors.TextMuted)
+                                        inner()
+                                    }
+                                },
+                            )
+                            if (conversation?.running == true) {
+                                FilledIconButton(
+                                    onStop, Modifier.size(50.dp).testTag("conversation-stop")
+                                        .semantics { contentDescription = "停止任务" },
+                                    enabled = !state.stoppingTurn,
+                                ) { Icon(Icons.Rounded.Stop, if (state.stoppingTurn) "停止中" else "停止") }
+                            } else {
+                                FilledIconButton(
+                                    onSend, Modifier.size(50.dp).testTag("conversation-send")
+                                        .semantics { contentDescription = "发送消息" },
+                                    enabled = canDispatchMessage(state, state.draft, state.draftImages),
+                                ) { Icon(Icons.AutoMirrored.Outlined.Send, "发送") }
+                            }
+                        }
                     }
                 }
             }
@@ -1599,7 +1730,179 @@ internal fun workspaceSaveUnavailableReason(entry: WorkspaceEntry, access: Works
 }
 
 @Composable
-internal fun ConversationHistory(core: CoreState, openCodexId: String?, modifier: Modifier = Modifier) {
+private fun DraftImageStrip(
+    images: List<DraftImageAttachment>,
+    busy: Boolean,
+    onPreview: (String) -> Unit,
+    onRemove: (String) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).testTag("draft-image-strip"),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        images.forEach { image ->
+            Box(Modifier.size(92.dp).testTag("draft-image-${image.localId}")) {
+                LocalImageThumbnail(
+                    image.localPath,
+                    image.filename,
+                    Modifier.fillMaxSize(),
+                    "预览草稿图片 ${image.filename}",
+                ) { if (!busy) onPreview(image.localPath) }
+                FilledIconButton(
+                    { onRemove(image.localId) },
+                    Modifier.align(Alignment.TopEnd).size(30.dp).testTag("remove-draft-image-${image.localId}")
+                        .semantics { contentDescription = "移除图片 ${image.filename}" },
+                    enabled = !busy,
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = CodexColors.Charcoal.copy(alpha = 0.92f),
+                    ),
+                ) { Icon(Icons.Rounded.Close, "移除图片", Modifier.size(17.dp)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageImagePart(
+    part: UserMessagePart,
+    busy: Boolean,
+    tag: String,
+    onPreview: (String) -> Unit,
+    onOpenHistoryImage: (ImageAttachmentDescriptor) -> Unit,
+) {
+    val localPath = part.localPath
+    if (localPath.isNotBlank()) {
+        LocalImageThumbnail(
+            localPath,
+            "消息图片",
+            Modifier.fillMaxWidth().heightIn(min = 96.dp, max = 220.dp).testTag(tag),
+            "预览消息图片",
+        ) { onPreview(localPath) }
+        return
+    }
+    val descriptor = part.image
+    if (descriptor == null) {
+        Text("图片信息缺失", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
+        return
+    }
+    Surface(
+        Modifier.fillMaxWidth().testTag(tag),
+        shape = RoundedCornerShape(12.dp),
+        color = CodexColors.Charcoal,
+        border = BorderStroke(1.dp, CodexColors.Border),
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Icon(Icons.Rounded.Image, null, Modifier.size(34.dp), tint = CodexColors.Indigo)
+            Column(Modifier.weight(1f)) {
+                Text(
+                    descriptor.filename.ifBlank { "历史图片" },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                descriptor.sizeBytes.takeIf { it > 0 }?.let {
+                    Text(formatByteLimit(it), color = CodexColors.TextMuted, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            TextButton(
+                { onOpenHistoryImage(descriptor) },
+                enabled = !busy,
+                modifier = Modifier.testTag("load-$tag").semantics {
+                    contentDescription = "加载或重试图片 ${descriptor.filename.ifBlank { "历史图片" }}"
+                },
+            ) { Text(if (busy) "加载中…" else "加载 / 重试") }
+        }
+    }
+}
+
+@Composable
+private fun LocalImageThumbnail(
+    path: String,
+    label: String,
+    modifier: Modifier,
+    description: String,
+    onClick: () -> Unit,
+) {
+    val bitmap = remember(path) { decodeSampledBitmap(path, 512, 512L * 512)?.asImageBitmap() }
+    Surface(
+        modifier.clip(RoundedCornerShape(12.dp)).clickable(enabled = bitmap != null, onClick = onClick),
+        shape = RoundedCornerShape(12.dp),
+        color = CodexColors.Charcoal,
+        border = BorderStroke(1.dp, CodexColors.Border),
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap,
+                description,
+                Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        } else {
+            Column(
+                Modifier.fillMaxSize().padding(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Icon(Icons.Rounded.BrokenImage, null, tint = MaterialTheme.colorScheme.error)
+                Text("图片缓存缺失", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                if (label.isNotBlank()) {
+                    Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ImagePreviewDialog(path: String, onClose: () -> Unit) {
+    val bitmap = remember(path) { decodeSampledBitmap(path, 2048, 4_000_000L)?.asImageBitmap() }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(
+            Modifier.fillMaxSize().padding(18.dp).testTag("image-preview-dialog"),
+            shape = RoundedCornerShape(18.dp),
+            color = CodexColors.Charcoal,
+        ) {
+            Box(Modifier.fillMaxSize()) {
+                if (bitmap != null) {
+                    Image(
+                        bitmap,
+                        "图片预览",
+                        Modifier.fillMaxSize().padding(8.dp),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    Column(
+                        Modifier.align(Alignment.Center).padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(Icons.Rounded.BrokenImage, null, tint = MaterialTheme.colorScheme.error)
+                        Text("图片缓存已失效，请关闭后重新加载", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                FilledIconButton(
+                    onClose,
+                    Modifier.align(Alignment.TopEnd).padding(10.dp).testTag("close-image-preview")
+                        .semantics { contentDescription = "关闭图片预览" },
+                ) { Icon(Icons.Rounded.Close, "关闭图片预览") }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun ConversationHistory(
+    core: CoreState,
+    openCodexId: String?,
+    modifier: Modifier = Modifier,
+    imageAttachmentBusy: Boolean = false,
+    onShowImagePreview: (String) -> Unit = {},
+    onOpenHistoryImage: (ImageAttachmentDescriptor) -> Unit = {},
+) {
     val conversation = core.conversation?.takeIf { it.codexId == openCodexId }
     val listState = rememberLazyListState()
     Box(
@@ -1657,7 +1960,14 @@ internal fun ConversationHistory(core: CoreState, openCodexId: String?, modifier
                                             ?: turn?.startedAtUnixMs
                                         else -> turn?.startedAtUnixMs
                                     }?.takeIf { it > 0 }?.let(::formatTimelineTime).orEmpty()
-                                    TimelineItem(entry.item, timestamp, connectBelow)
+                                    TimelineItem(
+                                        entry.item,
+                                        timestamp,
+                                        connectBelow,
+                                        imageAttachmentBusy,
+                                        onShowImagePreview,
+                                        onOpenHistoryImage,
+                                    )
                                 }
                                 is TimelineDisplayEntry.ProcessGroup -> {
                                     val timestamp = turn?.startedAtUnixMs?.takeIf { it > 0 }
@@ -1816,16 +2126,39 @@ internal fun groupTimelineEntries(entries: List<ConversationTimelineEntry>): Lis
 }
 
 @Composable
-internal fun TimelineItem(item: ConversationItem, timestamp: String = "", connectBelow: Boolean = false) {
+internal fun TimelineItem(
+    item: ConversationItem,
+    timestamp: String = "",
+    connectBelow: Boolean = false,
+    imageAttachmentBusy: Boolean = false,
+    onShowImagePreview: (String) -> Unit = {},
+    onOpenHistoryImage: (ImageAttachmentDescriptor) -> Unit = {},
+) {
     when (item.type) {
-        "user_message" -> MessageBubble("你", item.userMessage?.text.orEmpty(), true, item, timestamp, connectBelow)
-        "agent_message" -> MessageBubble("Codex", item.agentMessage?.text.orEmpty(), false, item, timestamp, false)
+        "user_message" -> MessageBubble(
+            "你", item.userMessage?.text.orEmpty(), true, item, timestamp, connectBelow,
+            imageAttachmentBusy, onShowImagePreview, onOpenHistoryImage,
+        )
+        "agent_message" -> MessageBubble(
+            "Codex", item.agentMessage?.text.orEmpty(), false, item, timestamp, false,
+            imageAttachmentBusy, onShowImagePreview, onOpenHistoryImage,
+        )
         else -> ProcessGroupCard(listOf(item), timestamp, connectBelow)
     }
 }
 
 @Composable
-private fun MessageBubble(label: String, text: String, user: Boolean, item: ConversationItem, timestamp: String, connectBelow: Boolean) {
+private fun MessageBubble(
+    label: String,
+    text: String,
+    user: Boolean,
+    item: ConversationItem,
+    timestamp: String,
+    connectBelow: Boolean,
+    imageAttachmentBusy: Boolean,
+    onShowImagePreview: (String) -> Unit,
+    onOpenHistoryImage: (ImageAttachmentDescriptor) -> Unit,
+) {
     val avatarBackground = if (user) CodexColors.IndigoSoft else Color(0xFF392A6E)
     val avatarForeground = if (user) Color(0xFFBBC3FF) else Color(0xFFD6C7FF)
     val bubbleColor = if (user) CodexColors.IndigoSoft.copy(alpha = 0.72f) else CodexColors.Raised
@@ -1872,7 +2205,30 @@ private fun MessageBubble(label: String, text: String, user: Boolean, item: Conv
                         if (!user) MessageStatusAndTime(item, timestamp)
                     }
                     if (user) {
-                        Text(text.ifBlank { "（空消息）" }, style = MaterialTheme.typography.bodyLarge, color = CodexColors.Text)
+                        val parts = item.userMessage?.parts.orEmpty()
+                        if (parts.isEmpty()) {
+                            Text(text.ifBlank { "（空消息）" }, style = MaterialTheme.typography.bodyLarge, color = CodexColors.Text)
+                        } else {
+                            parts.forEachIndexed { index, part ->
+                                when (part.type) {
+                                    "text" -> if (part.text.isNotBlank()) {
+                                        Text(
+                                            part.text,
+                                            Modifier.testTag("message-text-part-${item.itemId}-$index"),
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = CodexColors.Text,
+                                        )
+                                    }
+                                    "image" -> MessageImagePart(
+                                        part,
+                                        imageAttachmentBusy,
+                                        "message-image-${item.itemId}-$index",
+                                        onShowImagePreview,
+                                        onOpenHistoryImage,
+                                    )
+                                }
+                            }
+                        }
                     } else {
                         MarkdownBody(text, "（空消息）", MaterialTheme.typography.bodyLarge)
                     }

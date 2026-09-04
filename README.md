@@ -11,7 +11,7 @@
 - 默认 Host：`ws://codex-remote-linux/connect`
 
 应用已接入 `MobileCore` AAR，在进程内启动 Tailnet，并通过 Codex Remote
-协议 v1.1.2 连接 Host。首次使用需要登录 Tailscale 时，界面会显示登录入口；
+协议 v1.2.0 连接 Host。首次使用需要登录 Tailscale 时，界面会显示登录入口；
 连接成功后会执行 `GetHost` 和 `ListCodexes`，并在首页展示 Tailnet 状态、
 可编辑且持久化的 Host 地址以及 Host 返回的 Codex 列表。
 
@@ -28,12 +28,11 @@
 
 ## 验证范围
 
-v0.3.1 是会话稳定性补丁：发送后会立即显示用户消息，并在 StartTurn response、Host watch
-事件和历史校准乱序时保持一致；发送被明确拒绝时仍会恢复未发送草稿。
+v0.3.2 新增原生图片附件：支持系统图片选择与内容接收、发送前预览与移除、按顺序发送
+文字和图片，并能在历史中下载、缓存和重试图片；上传重试会保持稳定 request ID。
 
-当前 v0.3.1 候选版本的 MobileCore Go 全量与 `-race` 测试均通过；普通
-`go test -json -count=1 ./...` 运行共有 140 个通过的 Test/subtest 事件；JVM 142/142、
-API 36 x86_64 低资源模拟器 connected suite 53/53。connected 稳定配置为 1536 MiB、
+当前 v0.3.2 候选版本的 MobileCore Go 全量与 `-race` 测试均通过；JVM 155/155、
+API 36 x86_64 低资源模拟器 connected suite 58/58。connected 稳定配置为 1536 MiB、
 2 核、720x1600@320、SwiftShader GLES 并明确禁用 Vulkan；emulator 实际 guest
 `MemTotal` 约 2532296 kB。
 现有自动化覆盖连接与错误状态、项目目录和 session 可用性、会话管理、rich timeline、
@@ -57,9 +56,9 @@ APK 中 arm64 native ELF 的 `LOAD` segment 对齐为 `0x4000`，且该 native �
 
 ## 下载 APK
 
-当前个人 Demo 可从 [GitHub Release v0.3.1](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.3.1)
-下载 `codex-remote-android-v0.3.1-debug.apk`，或使用
-[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.3.1/codex-remote-android-v0.3.1-debug.apk)。
+当前个人 Demo 可从 [GitHub Release v0.3.2](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.3.2)
+下载 `codex-remote-android-v0.3.2-debug.apk`，或使用
+[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.3.2/codex-remote-android-v0.3.2-debug.apk)。
 这是便于试用的 debug APK，并非商店签名的正式发行包。
 
 ## 构建

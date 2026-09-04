@@ -1,5 +1,6 @@
 package com.firefly.codexremote
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.width
@@ -9,7 +10,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -17,6 +20,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.unit.dp
+import androidx.test.platform.app.InstrumentationRegistry
+import java.io.File
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -505,5 +510,205 @@ class TimelineItemTest {
 
         compose.onNodeWithText("内容已截断").assertIsDisplayed()
         compose.onAllNodesWithText("hidden output").assertCountEquals(0)
+    }
+
+    @Test
+    fun mixedUserMessagePartsKeepTextImageTextOrder() {
+        val item = ConversationItem(
+            itemId = "mixed",
+            turnId = "T",
+            type = "user_message",
+            status = "completed",
+            userMessage = UserMessageItem(
+                textParts = listOf("图片前", "图片后"),
+                text = "图片前\n图片后",
+                parts = listOf(
+                    UserMessagePart("text", text = "图片前"),
+                    UserMessagePart("image", localPath = "/missing/image.png"),
+                    UserMessagePart("text", text = "图片后"),
+                ),
+            ),
+        )
+        compose.setContent { CodexRemoteTheme { TimelineItem(item) } }
+
+        val first = compose.onNodeWithTag("message-text-part-mixed-0").fetchSemanticsNode().boundsInRoot
+        val image = compose.onNodeWithTag("message-image-mixed-1").fetchSemanticsNode().boundsInRoot
+        val last = compose.onNodeWithTag("message-text-part-mixed-2").fetchSemanticsNode().boundsInRoot
+        assertTrue(first.top < image.top)
+        assertTrue(image.top < last.top)
+        compose.onAllNodesWithText("图片前\n图片后").assertCountEquals(0)
+    }
+
+    @Test
+    fun historyImageCardLoadsAndOffersRetryWithoutAPath() {
+        val descriptor = ImageAttachmentDescriptor(
+            attachmentId = "A-1",
+            filename = "截图.png",
+            mimeType = "image/png",
+            sizeBytes = 1234,
+            sha256 = "abc",
+        )
+        var opened: ImageAttachmentDescriptor? = null
+        val item = ConversationItem(
+            itemId = "history-image",
+            turnId = "T",
+            type = "user_message",
+            status = "completed",
+            userMessage = UserMessageItem(
+                emptyList(),
+                "",
+                listOf(UserMessagePart("image", image = descriptor)),
+            ),
+        )
+        compose.setContent {
+            CodexRemoteTheme {
+                TimelineItem(item, onOpenHistoryImage = { opened = it })
+            }
+        }
+
+        compose.onNodeWithText("截图.png").assertIsDisplayed()
+        compose.onNodeWithText("加载 / 重试").assertIsEnabled().performClick()
+        compose.runOnIdle { assertTrue(opened == descriptor) }
+    }
+
+    @Test
+    fun draftImagesAndWholeComposerAreDisabledDuringUnknownSend() {
+        val draft = DraftImageAttachment(
+            localId = "D-1",
+            codexId = "C",
+            filename = "草稿.png",
+            mimeType = "image/png",
+            localPath = "/missing/draft.png",
+            sizeBytes = 10,
+            sha256 = "hash",
+            widthPixels = 10,
+            heightPixels = 10,
+        )
+        var chooseCount = 0
+        val core = CoreState(
+            phase = "starting_turn",
+            codexes = listOf(CodexSummary("C", "图片会话", "/work", "IDLE")),
+            selectedCodexId = "C",
+            conversation = ConversationState("C", historyComplete = true),
+            imageAttachments = ImageAttachmentState(
+                supported = true,
+                maxUploadBytes = 1024,
+                supportedMimeTypes = listOf("image/png"),
+                codexId = "C",
+            ),
+        )
+        compose.setContent {
+            CodexRemoteTheme {
+                CodexRemoteScreen(
+                    state = AppUiState(
+                        core = core,
+                        openCodexId = "C",
+                        draft = "发送中",
+                        draftImages = listOf(draft),
+                        optimisticUserMessages = listOf(OptimisticUserMessage("CMD", "C", "发送中")),
+                    ),
+                    onHostAddressChanged = {}, onConnect = {}, onRefresh = {}, onOpenAuth = {},
+                    onOpenConversation = {}, onCloseConversation = {}, onDraftChanged = {}, onSend = {}, onStop = {},
+                    onChooseImage = { chooseCount++ },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("conversation-add-image").assertIsNotEnabled().performClick()
+        compose.onNodeWithTag("conversation-input").assertIsNotEnabled()
+        compose.onNodeWithTag("remove-draft-image-D-1").assertIsNotEnabled().performClick()
+        compose.onNodeWithTag("conversation-send").assertIsNotEnabled().performClick()
+        compose.runOnIdle { assertTrue(chooseCount == 0) }
+    }
+
+    @Test
+    fun imageButtonAndMissingPreviewUseChineseActions() {
+        var chooseCount = 0
+        var closeCount = 0
+        val core = CoreState(
+            phase = "ready",
+            codexes = listOf(CodexSummary("C", "图片会话", "/work", "IDLE")),
+            selectedCodexId = "C",
+            conversation = ConversationState("C", historyComplete = true),
+            imageAttachments = ImageAttachmentState(
+                supported = true,
+                maxUploadBytes = 1024,
+                supportedMimeTypes = listOf("image/png"),
+                codexId = "C",
+            ),
+        )
+        compose.setContent {
+            CodexRemoteTheme {
+                CodexRemoteScreen(
+                    state = AppUiState(core = core, openCodexId = "C", imagePreviewPath = "/missing/preview.png"),
+                    onHostAddressChanged = {}, onConnect = {}, onRefresh = {}, onOpenAuth = {},
+                    onOpenConversation = {}, onCloseConversation = {}, onDraftChanged = {}, onSend = {}, onStop = {},
+                    onChooseImage = { chooseCount++ }, onCloseImagePreview = { closeCount++ },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("conversation-add-image").assertIsEnabled().performClick()
+        compose.onNodeWithText("图片缓存已失效，请关闭后重新加载").assertIsDisplayed()
+        compose.onNodeWithContentDescription("关闭图片预览").performClick()
+        compose.runOnIdle {
+            assertTrue(chooseCount == 1)
+            assertTrue(closeCount == 1)
+        }
+    }
+
+    @Test
+    fun enabledDraftImageCanBePreviewedAndRemoved() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val imageFile = File(context.cacheDir, "draft-image-ui-test.png")
+        Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888).also { bitmap ->
+            imageFile.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            bitmap.recycle()
+        }
+        val draft = DraftImageAttachment(
+            localId = "D-enabled",
+            codexId = "C",
+            filename = "草稿.png",
+            mimeType = "image/png",
+            localPath = imageFile.absolutePath,
+            sizeBytes = imageFile.length(),
+            sha256 = "hash",
+            widthPixels = 4,
+            heightPixels = 4,
+        )
+        var previewedPath = ""
+        var removedId = ""
+        val core = CoreState(
+            phase = "ready",
+            codexes = listOf(CodexSummary("C", "图片会话", "/work", "IDLE")),
+            selectedCodexId = "C",
+            conversation = ConversationState("C", historyComplete = true),
+            imageAttachments = ImageAttachmentState(
+                supported = true,
+                maxUploadBytes = 1024,
+                supportedMimeTypes = listOf("image/png"),
+                codexId = "C",
+            ),
+        )
+        try {
+            compose.setContent {
+                CodexRemoteTheme {
+                    CodexRemoteScreen(
+                        state = AppUiState(core = core, openCodexId = "C", draftImages = listOf(draft)),
+                        onHostAddressChanged = {}, onConnect = {}, onRefresh = {}, onOpenAuth = {},
+                        onOpenConversation = {}, onCloseConversation = {}, onDraftChanged = {}, onSend = {}, onStop = {},
+                        onShowImagePreview = { previewedPath = it },
+                        onRemoveDraftImage = { removedId = it },
+                    )
+                }
+            }
+
+            compose.onNodeWithContentDescription("预览草稿图片 草稿.png").performClick()
+            compose.runOnIdle { assertTrue(previewedPath == imageFile.absolutePath) }
+            compose.onNodeWithTag("remove-draft-image-D-enabled").assertIsEnabled().performClick()
+            compose.runOnIdle { assertTrue(removedId == "D-enabled") }
+        } finally {
+            imageFile.delete()
+        }
     }
 }

@@ -362,6 +362,40 @@ func (s *liveSession) StartTurn(ctx context.Context, commandID, codexID, text st
 	return s.currentClient().StartTurn(ctx, commandID, codexID, text, options)
 }
 
+func (s *liveSession) StartTurnParts(ctx context.Context, commandID, codexID string, parts []turnInputPart, options *turnOptionsPayload) (string, error) {
+	return s.currentClient().StartTurnParts(ctx, commandID, codexID, parts, options)
+}
+
+func (s *liveSession) ImageAttachmentSupport() (imageAttachmentCapabilities, bool, error) {
+	return s.currentClient().ImageAttachmentSupport()
+}
+
+func (s *liveSession) UploadImageAttachment(ctx context.Context, requestID string, request imageAttachmentUploadRequest) (imageAttachmentUploadResult, error) {
+	for {
+		client := s.currentClient()
+		result, err := client.UploadImageAttachment(ctx, requestID, request)
+		if !errors.Is(err, errHostConnectionClosed) {
+			return result, err
+		}
+		if err := s.reconnectClient(ctx, client); err != nil {
+			return imageAttachmentUploadResult{}, err
+		}
+	}
+}
+
+func (s *liveSession) DownloadImageAttachment(ctx context.Context, requestID, codexID, attachmentID string) (imageAttachmentDownloadResult, error) {
+	for {
+		client := s.currentClient()
+		result, err := client.DownloadImageAttachment(ctx, requestID, codexID, attachmentID)
+		if !errors.Is(err, errHostConnectionClosed) {
+			return result, err
+		}
+		if err := s.reconnectClient(ctx, client); err != nil {
+			return imageAttachmentDownloadResult{}, err
+		}
+	}
+}
+
 func (s *liveSession) InterruptTurn(ctx context.Context, codexID, turnID string) (string, error) {
 	return s.currentClient().InterruptTurn(ctx, codexID, turnID)
 }

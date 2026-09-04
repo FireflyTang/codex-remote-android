@@ -113,6 +113,21 @@ func mergeConversationItem(left, right conversationItem) conversationItem {
 		if len(out.UserMessage.TextParts) < len(left.UserMessage.TextParts) {
 			out.UserMessage.TextParts = append([]string{}, left.UserMessage.TextParts...)
 		}
+		if len(out.UserMessage.Parts) < len(left.UserMessage.Parts) {
+			out.UserMessage.Parts = append([]conversationUserMessagePart{}, left.UserMessage.Parts...)
+		} else if len(out.UserMessage.Parts) == len(left.UserMessage.Parts) {
+			for i := range out.UserMessage.Parts {
+				if out.UserMessage.Parts[i].Type == "" {
+					out.UserMessage.Parts[i].Type = left.UserMessage.Parts[i].Type
+				}
+				if out.UserMessage.Parts[i].Text == "" {
+					out.UserMessage.Parts[i].Text = left.UserMessage.Parts[i].Text
+				}
+				if out.UserMessage.Parts[i].Image == nil && left.UserMessage.Parts[i].Image != nil {
+					out.UserMessage.Parts[i].Image = left.UserMessage.Parts[i].Image
+				}
+			}
+		}
 	}
 	if left.AgentMessage != nil && out.AgentMessage != nil {
 		out.AgentMessage.Text = preferLonger(left.AgentMessage.Text, out.AgentMessage.Text)
