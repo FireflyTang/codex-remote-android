@@ -42,7 +42,69 @@ class TimelineGroupingTest {
         assertEquals("missing-2", (grouped[2] as TimelineDisplayEntry.ProcessGroup).items.single().itemId)
     }
 
+    @Test
+    fun importedHistoryNoticeRequiresAProvenanceAndStrictImportBoundary() {
+        val imported = "PROVENANCE_KIND_IMPORTED_HISTORY"
+        val historical = turn("history", startedAt = 99, turnProvenance = imported, itemProvenance = imported)
+        val sameMillisecond = turn("same", startedAt = 100, turnProvenance = imported, itemProvenance = imported)
+        val newer = turn("new", startedAt = 101, turnProvenance = imported, itemProvenance = imported)
+
+        assertEquals("此轮来自导入的历史记录", timelineTurnProvenanceNotice(historical, importedAtUnixMs = 100))
+        assertEquals(null, timelineTurnProvenanceNotice(sameMillisecond, importedAtUnixMs = 100))
+        assertEquals(null, timelineTurnProvenanceNotice(newer, importedAtUnixMs = 100))
+        assertEquals(null, timelineTurnProvenanceNotice(historical, importedAtUnixMs = 0))
+        assertEquals(null, timelineTurnProvenanceNotice(turn("unspecified", 99, "", ""), 100))
+    }
+
+    @Test
+    fun explicitLiveWireSuppressesAnInheritedImportedTurnMarker() {
+        val turn = turn(
+            id = "live",
+            startedAt = 99,
+            turnProvenance = "PROVENANCE_KIND_IMPORTED_HISTORY",
+            itemProvenance = "PROVENANCE_KIND_LIVE_WIRE",
+        )
+
+        assertEquals(null, timelineTurnProvenanceNotice(turn, importedAtUnixMs = 100))
+    }
+
+    @Test
+    fun importedProvenanceNoticeIsOnlyShownOnTheFirstEntryInATurn() {
+        val imported = "PROVENANCE_KIND_IMPORTED_HISTORY"
+        val turn = turn("history", startedAt = 99, turnProvenance = imported, itemProvenance = imported)
+        val first = TimelineDisplayEntry.Message(turn.items[0], "first")
+        val second = TimelineDisplayEntry.Message(turn.items[1], "second")
+
+        assertEquals(
+            listOf("此轮来自导入的历史记录"),
+            timelineUiProtocolNotices(first, turn, firstEntryInTurn = true, importedAtUnixMs = 100),
+        )
+        assertEquals(
+            emptyList<String>(),
+            timelineUiProtocolNotices(second, turn, firstEntryInTurn = false, importedAtUnixMs = 100),
+        )
+    }
+
     private fun item(id: String, turnId: String, type: String) = ConversationTimelineEntry.Item(
         ConversationItem(itemId = id, turnId = turnId, type = type, status = "completed"),
+    )
+
+    private fun turn(
+        id: String,
+        startedAt: Long,
+        turnProvenance: String,
+        itemProvenance: String,
+    ) = ConversationTurn(
+        turnId = id,
+        status = "completed",
+        failure = "",
+        startedAtUnixMs = startedAt,
+        completedAtUnixMs = startedAt + 1,
+        items = listOf(
+            ConversationItem("$id-1", id, "agent_message", "completed", provenance = itemProvenance),
+            ConversationItem("$id-2", id, "agent_message", "completed", provenance = itemProvenance),
+        ),
+        messages = emptyList(),
+        provenance = turnProvenance,
     )
 }

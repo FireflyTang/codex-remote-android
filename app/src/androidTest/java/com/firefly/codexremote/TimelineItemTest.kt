@@ -2,6 +2,9 @@ package com.firefly.codexremote
 
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
@@ -237,6 +240,59 @@ class TimelineItemTest {
     }
 
     @Test
+    fun conversationHistoryScrollsToNewMessagesAndKeepsThemVisibleAfterRecomposition() {
+        fun message(id: String, turnId: String, role: String, text: String) = ConversationItem(
+            itemId = id,
+            turnId = turnId,
+            type = if (role == "user") "user_message" else "agent_message",
+            status = "completed",
+            userMessage = if (role == "user") UserMessageItem(listOf(text), text) else null,
+            agentMessage = if (role == "assistant") AgentMessageItem(text) else null,
+        )
+        val oldItems = (1..24).map { index ->
+            message("old-$index", "old-turn", "assistant", "旧消息 $index")
+        }
+        val oldTurn = ConversationTurn("old-turn", "completed", "", 1, 2, oldItems, emptyList())
+        var core by mutableStateOf(
+            CoreState(
+                revision = 1,
+                conversation = ConversationState("C", historyComplete = true, turns = listOf(oldTurn)),
+            ),
+        )
+        compose.setContent {
+            MaterialTheme {
+                ConversationHistory(core, "C", Modifier.fillMaxSize())
+            }
+        }
+
+        compose.onNodeWithText("旧消息 24").assertIsDisplayed()
+        val newTurn = ConversationTurn(
+            "new-turn",
+            "completed",
+            "",
+            3,
+            4,
+            listOf(
+                message("new-user", "new-turn", "user", "刚发送的问题"),
+                message("new-agent", "new-turn", "assistant", "最新回复"),
+            ),
+            emptyList(),
+        )
+        compose.runOnIdle {
+            core = CoreState(
+                revision = 2,
+                conversation = ConversationState("C", historyComplete = true, turns = listOf(oldTurn, newTurn)),
+            )
+        }
+
+        compose.onNodeWithText("刚发送的问题").assertIsDisplayed()
+        compose.onNodeWithText("最新回复").assertIsDisplayed()
+        compose.runOnIdle { core = core.copy(revision = 3) }
+        compose.onNodeWithText("刚发送的问题").assertIsDisplayed()
+        compose.onNodeWithText("最新回复").assertIsDisplayed()
+    }
+
+    @Test
     fun importedHistoryProvenanceIsShownOncePerTurn() {
         val items = listOf("one", "two").mapIndexed { index, id ->
             ConversationItem(
@@ -264,13 +320,77 @@ class TimelineItemTest {
         )
         compose.setContent {
             MaterialTheme {
-                ConversationHistory(CoreState(conversation = conversation), "C", Modifier.fillMaxSize())
+                ConversationHistory(
+                    CoreState(
+                        codexes = listOf(CodexSummary("C", "导入会话", "/work", "IDLE", importedAtUnixMs = 10)),
+                        conversation = conversation,
+                    ),
+                    "C",
+                    Modifier.fillMaxSize(),
+                )
             }
         }
 
         compose.onAllNodesWithText("此轮来自导入的历史记录").assertCountEquals(1)
         compose.onAllNodesWithText("来自导入的历史记录").assertCountEquals(0)
-        compose.onAllNodesWithText("由 Host 重建").assertCountEquals(1)
+        compose.onAllNodesWithText("由 Host 重建").assertCountEquals(0)
+    }
+
+    @Test
+    fun importedHistoryNoticeStopsAtImportBoundaryForNewRealtimeTurn() {
+        fun message(id: String, turnId: String, text: String, provenance: String) = ConversationItem(
+            itemId = id,
+            turnId = turnId,
+            type = "agent_message",
+            status = "completed",
+            agentMessage = AgentMessageItem(text),
+            provenance = provenance,
+        )
+        val imported = "PROVENANCE_KIND_IMPORTED_HISTORY"
+        val historyTurn = ConversationTurn(
+            "history",
+            "completed",
+            "",
+            50,
+            60,
+            listOf(
+                message("history-1", "history", "历史一", imported),
+                message("history-2", "history", "历史二", imported),
+            ),
+            emptyList(),
+            provenance = imported,
+        )
+        val newTurnReloadedFromHistory = ConversationTurn(
+            "new",
+            "completed",
+            "",
+            150,
+            160,
+            listOf(message("new-1", "new", "刚刚的新回复", imported)),
+            emptyList(),
+            provenance = imported,
+        )
+        compose.setContent {
+            MaterialTheme {
+                ConversationHistory(
+                    CoreState(
+                        codexes = listOf(
+                            CodexSummary("C", "导入会话", "/work", "IDLE", importedAtUnixMs = 100),
+                        ),
+                        conversation = ConversationState(
+                            codexId = "C",
+                            historyComplete = true,
+                            turns = listOf(historyTurn, newTurnReloadedFromHistory),
+                        ),
+                    ),
+                    "C",
+                    Modifier.fillMaxSize(),
+                )
+            }
+        }
+
+        compose.onAllNodesWithText("此轮来自导入的历史记录").assertCountEquals(1)
+        compose.onNodeWithText("刚刚的新回复").assertIsDisplayed()
     }
 
     @Test

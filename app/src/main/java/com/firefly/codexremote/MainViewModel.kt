@@ -141,8 +141,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onActivityStarted(nowElapsedRealtimeMs: Long) {
         if (!foregroundResumeGate.onStarted(nowElapsedRealtimeMs)) return
-        if (foregroundRecoveryAction(uiState.value) == ForegroundRecoveryAction.CONNECT) {
-            connectInternal(foregroundRecovery = true)
+        when (foregroundRecoveryAction(uiState.value)) {
+            ForegroundRecoveryAction.REFRESH -> refreshForegroundConnection()
+            ForegroundRecoveryAction.CONNECT -> connectInternal(foregroundRecovery = true)
+            ForegroundRecoveryAction.NONE -> Unit
         }
     }
 
@@ -150,7 +152,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         foregroundResumeGate.onStopped(nowElapsedRealtimeMs, changingConfigurations)
     }
 
-    private fun connectInternal(foregroundRecovery: Boolean) {
+    private fun connectInternal(foregroundRecovery: Boolean, continueForegroundRecovery: Boolean = false) {
         val startingState = uiState.value
         val endpoint = startingState.hostAddress.trim()
         if (endpoint.isEmpty()) return
@@ -172,14 +174,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .put("clientVersion", clientVersion)
             val commands = connectCommands(payload)
             if (foregroundRecovery) {
-                foregroundRecoveryTracker.begin(
-                    startCommandId = commands.last().getString("id"),
-                    originalCodexId = startingState.openCodexId?.takeIf { it.isNotBlank() },
-                )
+                val startCommandId = commands.last().getString("id")
+                if (continueForegroundRecovery) {
+                    foregroundRecoveryTracker.trackReconnect(startCommandId)
+                } else {
+                    foregroundRecoveryTracker.beginReconnect(
+                        recoveryCommandId = startCommandId,
+                        originalCodexId = startingState.openCodexId?.takeIf { it.isNotBlank() },
+                    )
+                }
             }
             commands.forEach { command ->
                 dispatchTracked(command, "connection")
             }
+        }
+    }
+
+    private fun refreshForegroundConnection() {
+        val startingState = uiState.value
+        val command = coreCommand("refresh")
+        foregroundRecoveryTracker.beginRefresh(
+            recoveryCommandId = command.getString("id"),
+            originalCodexId = startingState.openCodexId?.takeIf { it.isNotBlank() },
+        )
+        _uiState.update(::foregroundRecoveryStartingState)
+        viewModelScope.launch(Dispatchers.IO) {
+            dispatchTracked(command, "foreground.refresh")
         }
     }
 
@@ -300,7 +320,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cancelCreateMissingDirectory() {
-        _uiState.update { it.copy(missingDirectoryConfirmationPath = "") }
+        val recoverCore = AtomicBoolean(false)
+        _uiState.update { current ->
+            resolveMissingDirectoryCancel(current).let { decision ->
+                recoverCore.set(decision.refreshCore)
+                decision.nextState
+            }
+        }
+        if (recoverCore.get()) {
+            viewModelScope.launch(Dispatchers.IO) { dispatch("refresh") }
+        }
     }
 
     fun importSession(sessionId: String, source: String) {
@@ -830,7 +859,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val revisionEligible = shouldAcceptCoreRevision(_uiState.value.core.revision, decoded.revision)
         val foregroundResolution = if (revisionEligible) {
-            foregroundRecoveryTracker.onCoreState(decoded)
+            foregroundRecoveryTracker.onCoreState(
+                decoded,
+                reconnectAvailable = _uiState.value.hostAddress.isNotBlank(),
+            )
         } else {
             ForegroundRecoveryResolution.None
         }
@@ -839,9 +871,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 foregroundRecoveryTracker.trackSelection(command.getString("id"))
             }
         }
-        coreStateDiagnosticRecorder.record(decoded)
-        diagnosticActionTracker.consumeTerminal(decoded, _uiState.value)?.let { tracked ->
-            diagnosticLog.append("core.action.result", diagnosticResultDetails(decoded, tracked, _uiState.value))
+        val reconnectForeground = foregroundResolution is ForegroundRecoveryResolution.Reconnect
+        if (revisionEligible) {
+            coreStateDiagnosticRecorder.record(decoded)
+            diagnosticActionTracker.consumeTerminal(decoded, _uiState.value)?.let { tracked ->
+                diagnosticLog.append("core.action.result", diagnosticResultDetails(decoded, tracked, _uiState.value))
+            }
         }
         var listWorkspaceAfterGet: Pair<String, String>? = null
         var refreshWorkspaceDirectory: Pair<String, String>? = null
@@ -1068,6 +1103,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             viewModelScope.launch(Dispatchers.IO) {
                 dispatchTracked(command, "foreground.selection")
             }
+        }
+        if (reconnectForeground) {
+            connectInternal(foregroundRecovery = true, continueForegroundRecovery = true)
         }
         listWorkspaceAfterGet?.let { (codexId, directory) ->
             viewModelScope.launch(Dispatchers.IO) {
@@ -1300,6 +1338,23 @@ internal const val ProjectStageSelection = "selection"
 internal fun isMissingDirectoryError(error: String): Boolean =
     error.contains("directory does not exist", ignoreCase = true)
 
+internal data class MissingDirectoryCancelDecision(
+    val nextState: AppUiState,
+    val refreshCore: Boolean,
+)
+
+internal fun resolveMissingDirectoryCancel(state: AppUiState): MissingDirectoryCancelDecision =
+    MissingDirectoryCancelDecision(
+        nextState = state.copy(
+            missingDirectoryConfirmationPath = "",
+            projectError = "",
+        ),
+        refreshCore = state.missingDirectoryConfirmationPath.isNotBlank() &&
+        state.missingDirectoryConfirmationPath == state.projectPath.trim() &&
+        state.core.phase == "error" &&
+            isMissingDirectoryError(state.core.error),
+    )
+
 internal fun shouldConfirmMissingDirectory(
     current: AppUiState,
     decoded: CoreState,
@@ -1397,7 +1452,7 @@ internal class ForegroundResumeGate(
     }
 }
 
-internal enum class ForegroundRecoveryAction { NONE, CONNECT }
+internal enum class ForegroundRecoveryAction { NONE, REFRESH, CONNECT }
 
 internal fun foregroundRecoveryStartingState(state: AppUiState): AppUiState = state.copy(
     foregroundRecoveryInProgress = true,
@@ -1408,6 +1463,7 @@ internal fun foregroundRecoveryStartingState(state: AppUiState): AppUiState = st
 
 internal sealed interface ForegroundRecoveryResolution {
     data object None : ForegroundRecoveryResolution
+    data object Reconnect : ForegroundRecoveryResolution
     data class SelectCodex(val codexId: String) : ForegroundRecoveryResolution
     data class Finished(val codexId: String?) : ForegroundRecoveryResolution
     data class Failed(val message: String) : ForegroundRecoveryResolution
@@ -1415,16 +1471,38 @@ internal sealed interface ForegroundRecoveryResolution {
 
 internal class ForegroundRecoveryTracker {
     private var originalCodexId: String? = null
-    private var startCommandId = ""
+    private var recoveryCommandId = ""
     private var selectionCommandId = ""
+    private var recoveryIsRefresh = false
+    private var waitingToTrackReconnect = false
     private var waitingToTrackSelection = false
 
     @Synchronized
-    fun begin(startCommandId: String, originalCodexId: String?) {
-        this.startCommandId = startCommandId
+    fun beginRefresh(recoveryCommandId: String, originalCodexId: String?) {
+        begin(recoveryCommandId, originalCodexId, isRefresh = true)
+    }
+
+    @Synchronized
+    fun beginReconnect(recoveryCommandId: String, originalCodexId: String?) {
+        begin(recoveryCommandId, originalCodexId, isRefresh = false)
+    }
+
+    private fun begin(recoveryCommandId: String, originalCodexId: String?, isRefresh: Boolean) {
+        this.recoveryCommandId = recoveryCommandId
         this.originalCodexId = originalCodexId
+        recoveryIsRefresh = isRefresh
         selectionCommandId = ""
+        waitingToTrackReconnect = false
         waitingToTrackSelection = false
+    }
+
+    @Synchronized
+    fun trackReconnect(commandId: String) {
+        if (waitingToTrackReconnect) {
+            recoveryCommandId = commandId
+            recoveryIsRefresh = false
+            waitingToTrackReconnect = false
+        }
     }
 
     @Synchronized
@@ -1436,16 +1514,25 @@ internal class ForegroundRecoveryTracker {
     }
 
     @Synchronized
-    fun onCoreState(state: CoreState): ForegroundRecoveryResolution {
-        if (startCommandId.isBlank() && selectionCommandId.isBlank() && !waitingToTrackSelection) {
+    fun onCoreState(state: CoreState, reconnectAvailable: Boolean = true): ForegroundRecoveryResolution {
+        if (
+            recoveryCommandId.isBlank() && selectionCommandId.isBlank() &&
+            !waitingToTrackReconnect && !waitingToTrackSelection
+        ) {
             return ForegroundRecoveryResolution.None
         }
-        if (state.commandId == startCommandId) {
+        if (state.commandId == recoveryCommandId) {
             if (state.phase == "error" || state.error.isNotBlank()) {
-                return fail(state.error.ifBlank { "恢复 Host 连接失败" })
+                if (recoveryIsRefresh && reconnectAvailable) {
+                    recoveryCommandId = ""
+                    recoveryIsRefresh = false
+                    waitingToTrackReconnect = true
+                    return ForegroundRecoveryResolution.Reconnect
+                }
+                return fail()
             }
             if (state.phase != "ready") return ForegroundRecoveryResolution.None
-            startCommandId = ""
+            recoveryCommandId = ""
             val codexId = originalCodexId
             if (codexId == null) {
                 clear()
@@ -1456,7 +1543,7 @@ internal class ForegroundRecoveryTracker {
         }
         if (state.commandId == selectionCommandId) {
             if (state.phase == "error" || state.error.isNotBlank()) {
-                return fail(state.error.ifBlank { "恢复原会话失败" })
+                return fail()
             }
             if (state.phase != "ready") return ForegroundRecoveryResolution.None
             val expectedCodexId = originalCodexId
@@ -1464,21 +1551,23 @@ internal class ForegroundRecoveryTracker {
                 clear()
                 ForegroundRecoveryResolution.Finished(expectedCodexId)
             } else {
-                fail("Host 未返回原会话，已退回首页")
+                fail()
             }
         }
         return ForegroundRecoveryResolution.None
     }
 
-    private fun fail(message: String): ForegroundRecoveryResolution.Failed {
+    private fun fail(): ForegroundRecoveryResolution.Failed {
         clear()
-        return ForegroundRecoveryResolution.Failed(message)
+        return ForegroundRecoveryResolution.Failed("连接已失效，请手动重连")
     }
 
     private fun clear() {
         originalCodexId = null
-        startCommandId = ""
+        recoveryCommandId = ""
         selectionCommandId = ""
+        recoveryIsRefresh = false
+        waitingToTrackReconnect = false
         waitingToTrackSelection = false
     }
 }
@@ -1486,7 +1575,8 @@ internal class ForegroundRecoveryTracker {
 internal fun foregroundRecoveryAction(state: AppUiState): ForegroundRecoveryAction {
     if (foregroundRecoveryBlocked(state)) return ForegroundRecoveryAction.NONE
     return when (state.core.phase) {
-        "ready", "idle" ->
+        "ready" -> ForegroundRecoveryAction.REFRESH
+        "idle", "stopped", "configured", "disconnected" ->
             if (state.hostAddress.isNotBlank()) ForegroundRecoveryAction.CONNECT else ForegroundRecoveryAction.NONE
         else -> ForegroundRecoveryAction.NONE
     }

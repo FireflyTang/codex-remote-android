@@ -2,7 +2,10 @@ package mobilecore
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"path"
@@ -21,6 +24,8 @@ type responseResult struct {
 	response *remotev1.Response
 	err      error
 }
+
+var errHostConnectionClosed = errors.New("Host connection closed")
 
 type pendingWatchReset struct {
 	HeadEventSeq uint64
@@ -107,11 +112,12 @@ type frameConnection interface {
 }
 
 type protocolClient struct {
-	conn      frameConnection
-	hello     *remotev1.ServerHello
-	helloJSON []byte
-	ctx       context.Context
-	cancel    context.CancelFunc
+	conn            frameConnection
+	hello           *remotev1.ServerHello
+	helloJSON       []byte
+	requestIDPrefix string
+	ctx             context.Context
+	cancel          context.CancelFunc
 
 	writeGate chan struct{}
 	mu        sync.Mutex
@@ -123,6 +129,10 @@ type protocolClient struct {
 }
 
 func dialProtocol(ctx context.Context, cfg configPayload, dial func(context.Context, string, string) (net.Conn, error)) (*protocolClient, error) {
+	return dialProtocolWithRequestIDPrefix(ctx, cfg, dial, protocolRequestIDPrefix(cfg.ClientRunID))
+}
+
+func dialProtocolWithRequestIDPrefix(ctx context.Context, cfg configPayload, dial func(context.Context, string, string) (net.Conn, error), requestIDPrefix string) (*protocolClient, error) {
 	conn, err := dialWebSocket(ctx, cfg.HostEndpoint, dial)
 	if err != nil {
 		return nil, err
@@ -157,7 +167,7 @@ func dialProtocol(ctx context.Context, cfg configPayload, dial func(context.Cont
 	}
 	helloJSON, _ := (protojson.MarshalOptions{}).Marshal(server)
 	runCtx, cancel := context.WithCancel(context.Background())
-	c := &protocolClient{conn: conn, hello: server, helloJSON: helloJSON, ctx: runCtx, cancel: cancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{}}
+	c := &protocolClient{conn: conn, hello: server, helloJSON: helloJSON, requestIDPrefix: requestIDPrefix, ctx: runCtx, cancel: cancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{}}
 	go c.readLoop()
 	return c, nil
 }
@@ -843,7 +853,7 @@ func (c *protocolClient) WatchPending(ctx context.Context, codexID string) (pend
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return pendingWatchReset{}, nil, fmt.Errorf("Host connection is closed")
+		return pendingWatchReset{}, nil, errHostConnectionClosed
 	}
 	if c.eventSink != nil {
 		c.mu.Unlock()
@@ -1279,20 +1289,24 @@ func hostError(method string, e *remotev1.Error) error {
 }
 
 func (c *protocolClient) call(ctx context.Context, req *remotev1.Request) (*remotev1.Response, error) {
-	id := fmt.Sprintf("android-%d", c.sequence.Add(1))
+	sequence := c.sequence.Add(1)
+	ch := make(chan responseResult, 1)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, errHostConnectionClosed
+	}
+	if c.requestIDPrefix == "" {
+		c.requestIDPrefix = protocolRequestIDPrefix("")
+	}
+	id := fmt.Sprintf("%s-%d", c.requestIDPrefix, sequence)
+	c.pending[id] = ch
+	c.mu.Unlock()
 	req.RequestId = id
 	req.SentAtUnixMs = time.Now().UnixMilli()
 	if deadline, ok := ctx.Deadline(); ok {
 		req.DeadlineUnixMs = deadline.UnixMilli()
 	}
-	ch := make(chan responseResult, 1)
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("Host connection is closed")
-	}
-	c.pending[id] = ch
-	c.mu.Unlock()
 	if err := c.write(ctx, &remotev1.Frame{Payload: &remotev1.Frame_Request{Request: req}}); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
@@ -1301,6 +1315,9 @@ func (c *protocolClient) call(ctx context.Context, req *remotev1.Request) (*remo
 	}
 	select {
 	case result := <-ch:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return result.response, result.err
 	case <-ctx.Done():
 		c.mu.Lock()
@@ -1308,15 +1325,43 @@ func (c *protocolClient) call(ctx context.Context, req *remotev1.Request) (*remo
 		c.mu.Unlock()
 		return nil, ctx.Err()
 	case <-c.ctx.Done():
-		return nil, fmt.Errorf("Host connection closed")
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		select {
+		case result := <-ch:
+			return result.response, result.err
+		default:
+		}
+		return nil, errHostConnectionClosed
 	}
+}
+
+var protocolRequestNonceFallback atomic.Uint64
+
+func protocolRequestIDPrefix(clientRunID string) string {
+	nonce := make([]byte, 16)
+	if _, err := cryptorand.Read(nonce); err != nil {
+		nonce = protocolRequestFallbackNonce()
+	}
+	return protocolRequestIDPrefixWithNonce(clientRunID, nonce)
+}
+
+func protocolRequestFallbackNonce() []byte {
+	return []byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), protocolRequestNonceFallback.Add(1)))
+}
+
+func protocolRequestIDPrefixWithNonce(clientRunID string, nonce []byte) string {
+	runDigest := sha256.Sum256([]byte(clientRunID))
+	nonceDigest := sha256.Sum256(nonce)
+	return fmt.Sprintf("android-%x-%x", runDigest[:4], nonceDigest[:8])
 }
 
 func (c *protocolClient) readLoop() {
 	for {
 		typ, raw, err := c.conn.Read(c.ctx)
 		if err != nil {
-			c.failAll(fmt.Errorf("read Host frame: %w", err))
+			c.failAll(errHostConnectionClosed)
 			return
 		}
 		if typ != websocket.MessageText {
@@ -1358,7 +1403,7 @@ func (c *protocolClient) readLoop() {
 			c.mu.Unlock()
 		case *remotev1.Frame_Pong:
 		case *remotev1.Frame_Close:
-			c.failAll(fmt.Errorf("Host closed protocol: %s", body.Close.Message))
+			c.failAll(errHostConnectionClosed)
 			return
 		default:
 			c.failAll(fmt.Errorf("unexpected Host frame after handshake"))
@@ -1368,21 +1413,38 @@ func (c *protocolClient) readLoop() {
 }
 
 func (c *protocolClient) write(ctx context.Context, frame *remotev1.Frame) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-c.ctx.Done():
-		return fmt.Errorf("Host connection closed")
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errHostConnectionClosed
 	case <-c.writeGate:
 	}
 	defer func() { c.writeGate <- struct{}{} }()
+	raw, err := (protojson.MarshalOptions{}).Marshal(frame)
+	if err != nil {
+		return err
+	}
 	writeCtx, cancel := context.WithCancel(ctx)
 	stopClientCancel := context.AfterFunc(c.ctx, cancel)
 	defer func() {
 		stopClientCancel()
 		cancel()
 	}()
-	return writeFrame(writeCtx, c.conn, frame)
+	if err := c.conn.Write(writeCtx, websocket.MessageText, raw); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		c.failAll(errHostConnectionClosed)
+		return errHostConnectionClosed
+	}
+	return nil
 }
 
 func newWriteGate() chan struct{} {
@@ -1411,16 +1473,16 @@ func (c *protocolClient) failAll(err error) {
 	pending := c.pending
 	c.pending = map[string]chan responseResult{}
 	c.mu.Unlock()
-	c.cancel()
 	for _, ch := range pending {
 		ch <- responseResult{err: err}
 	}
+	c.cancel()
 }
 
 func (c *protocolClient) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
-		c.failAll(fmt.Errorf("client closed"))
+		c.failAll(errHostConnectionClosed)
 		_ = c.conn.CloseNow()
 	})
 	return err

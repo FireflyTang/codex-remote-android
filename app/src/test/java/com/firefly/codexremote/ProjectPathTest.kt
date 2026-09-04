@@ -262,6 +262,49 @@ class ProjectPathTest {
         assertFalse(shouldConfirmMissingDirectory(pending.copy(pendingProjectAction = "import_session"), missing))
     }
 
+    @Test
+    fun cancellingMatchingMissingDirectoryConfirmationRequestsOneRefresh() {
+        val state = AppUiState(
+            projectDialogOpen = true,
+            projectPath = "/work/new",
+            missingDirectoryConfirmationPath = "/work/new",
+            core = CoreState(
+                phase = "error",
+                error = "directory does not exist: /work/new",
+            ),
+        )
+
+        val decision = resolveMissingDirectoryCancel(state)
+
+        assertTrue(decision.refreshCore)
+        assertEquals("", decision.nextState.missingDirectoryConfirmationPath)
+        assertEquals("", decision.nextState.projectError)
+    }
+
+    @Test
+    fun cancelDoesNotRefreshForOrdinaryErrorOrAbsentOrStaleConfirmation() {
+        val matching = AppUiState(
+            projectDialogOpen = true,
+            projectPath = "/work/new",
+            missingDirectoryConfirmationPath = "/work/new",
+            core = CoreState(
+                phase = "error",
+                error = "directory does not exist: /work/new",
+            ),
+        )
+
+        assertFalse(
+            resolveMissingDirectoryCancel(
+                matching.copy(core = matching.core.copy(error = "permission denied: /work/new")),
+            ).refreshCore,
+        )
+        assertFalse(resolveMissingDirectoryCancel(matching.copy(missingDirectoryConfirmationPath = "")).refreshCore)
+        assertFalse(resolveMissingDirectoryCancel(matching.copy(projectPath = "/work/other")).refreshCore)
+        assertFalse(
+            resolveMissingDirectoryCancel(matching.copy(core = matching.core.copy(phase = "ready", error = ""))).refreshCore,
+        )
+    }
+
     private fun oldTurn() = ConversationTurn(
         turnId = "old",
         status = "completed",

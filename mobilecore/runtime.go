@@ -33,8 +33,9 @@ type snapshot struct {
 type productionStarter struct{ platform Platform }
 
 const (
-	hostDialMaxAttempts = 4
-	hostDialRetryDelay  = 500 * time.Millisecond
+	hostDialMaxAttempts    = 4
+	hostDialAttemptTimeout = 15 * time.Second
+	hostDialRetryDelay     = 500 * time.Millisecond
 )
 
 // hostDialError marks failures that happened before a WebSocket connection was
@@ -107,8 +108,8 @@ func (s productionStarter) Start(ctx context.Context, cfg configPayload, progres
 		return nil, snapshot{}, fmt.Errorf("bring userspace tailnet up: %w", err)
 	}
 	progress("connecting_host", "")
-	client, err := retryInitialHostDial(ctx, func() (*protocolClient, error) {
-		return dialProtocol(ctx, cfg, server.Dial)
+	client, err := retryInitialHostDial(ctx, hostDialAttemptTimeout, func(attemptCtx context.Context) (*protocolClient, error) {
+		return dialProtocol(attemptCtx, cfg, server.Dial)
 	}, waitHostDialRetry)
 	if err != nil {
 		return nil, snapshot{}, fmt.Errorf("%w; %s", err, tailnetEndpointDiagnostic(ctx, server, status, cfg.HostEndpoint))
@@ -125,12 +126,16 @@ func (s productionStarter) Start(ctx context.Context, cfg configPayload, progres
 
 func retryInitialHostDial(
 	ctx context.Context,
-	dial func() (*protocolClient, error),
+	attemptTimeout time.Duration,
+	dial func(context.Context) (*protocolClient, error),
 	wait func(context.Context, time.Duration) error,
 ) (*protocolClient, error) {
 	var lastErr error
 	for attempt := 1; attempt <= hostDialMaxAttempts; attempt++ {
-		client, err := dial()
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
+		client, err := dial(attemptCtx)
+		attemptErr := attemptCtx.Err()
+		cancelAttempt()
 		if err == nil {
 			return client, nil
 		}
@@ -138,7 +143,7 @@ func retryInitialHostDial(
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if !isTransientInitialHostDial(err) {
+		if !isRetryableInitialHostDial(err, attemptErr) {
 			return nil, err
 		}
 		if attempt == hostDialMaxAttempts {
@@ -149,6 +154,15 @@ func retryInitialHostDial(
 		}
 	}
 	return nil, fmt.Errorf("Host WebSocket unavailable after %d attempts: %w", hostDialMaxAttempts, lastErr)
+}
+
+func isRetryableInitialHostDial(err, attemptErr error) bool {
+	var dialErr *hostDialError
+	if errors.As(err, &dialErr) && dialErr.status != 0 {
+		return false
+	}
+	return isTransientInitialHostDial(err) ||
+		(errors.Is(attemptErr, context.DeadlineExceeded) && errors.Is(err, context.DeadlineExceeded))
 }
 
 func isTransientInitialHostDial(err error) bool {

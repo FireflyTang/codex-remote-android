@@ -897,6 +897,9 @@ func (c *Core) refresh(commandID string) string {
 		}
 		c.cancel()
 		c.cancel = nil
+		// network_changed may publish while Refresh is blocked; the terminal
+		// state must still complete the refresh command observed by Android.
+		c.state.CommandID = commandID
 		if err != nil {
 			c.state.Phase, c.state.Error = "error", err.Error()
 		} else {

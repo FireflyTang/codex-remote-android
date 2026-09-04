@@ -19,6 +19,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -1404,6 +1405,7 @@ internal fun workspaceSaveUnavailableReason(entry: WorkspaceEntry, access: Works
 @Composable
 internal fun ConversationHistory(core: CoreState, openCodexId: String?, modifier: Modifier = Modifier) {
     val conversation = core.conversation?.takeIf { it.codexId == openCodexId }
+    val listState = rememberLazyListState()
     Box(
         modifier.testTag("conversation-history").semantics { contentDescription = "会话历史" },
     ) {
@@ -1412,53 +1414,73 @@ internal fun ConversationHistory(core: CoreState, openCodexId: String?, modifier
                 Text("正在加载历史记录…", Modifier.align(Alignment.Center))
             conversation?.timelineEntries.isNullOrEmpty() ->
                 Text("还没有消息", Modifier.align(Alignment.Center), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            else -> LazyColumn(
-                Modifier.fillMaxSize(),
-                reverseLayout = true,
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 18.dp),
-            ) {
+            else -> {
                 val turnsById = conversation!!.turns.associateBy { it.turnId }
                 val displayEntries = groupTimelineEntries(conversation.timelineEntries)
-                itemsIndexed(
-                    displayEntries.asReversed(),
-                    key = { index, entry ->
-                        when (entry) {
-                            is TimelineDisplayEntry.Message -> entry.key
-                            is TimelineDisplayEntry.ProcessGroup -> entry.key
-                            is TimelineDisplayEntry.TurnFailure -> "failure-${entry.turnId}-$index"
-                        }
-                    },
-                ) { index, entry ->
-                    val chronologicalIndex = displayEntries.lastIndex - index
-                    val entryTurnId = entry.timelineTurnId()
-                    val nextTurnId = displayEntries.getOrNull(chronologicalIndex + 1)?.timelineTurnId()
-                    val connectBelow = entryTurnId.isNotBlank() && entryTurnId == nextTurnId
-                    val previousTurnId = displayEntries.getOrNull(chronologicalIndex - 1)?.timelineTurnId()
-                    val turn = turnsById[entryTurnId]
-                    val notices = timelineUiProtocolNotices(entry, turn, entryTurnId != previousTurnId)
-                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                        if (notices.isNotEmpty()) ProtocolNoticeText(notices, "timeline-notice-${entry.key}")
-                        when (entry) {
-                            is TimelineDisplayEntry.Message -> {
-                                val timestamp = when (entry.item.type) {
-                                    "agent_message" -> turn?.completedAtUnixMs?.takeIf { it > 0 }
-                                        ?: turn?.startedAtUnixMs
-                                    else -> turn?.startedAtUnixMs
-                                }?.takeIf { it > 0 }?.let(::formatTimelineTime).orEmpty()
-                                TimelineItem(entry.item, timestamp, connectBelow)
+                val importedAtUnixMs = core.codexes.firstOrNull { it.id == conversation.codexId }
+                    ?.importedAtUnixMs ?: 0
+                val newestEntryIndex = conversation.timelineEntries.lastIndex
+                val newestEntryKey = conversation.timelineEntries.last().scrollAnchorKey(newestEntryIndex)
+                LaunchedEffect(conversation.codexId, newestEntryKey, conversation.timelineEntries.size) {
+                    listState.scrollToItem(0)
+                }
+                LazyColumn(
+                    Modifier.fillMaxSize(),
+                    state = listState,
+                    reverseLayout = true,
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 18.dp),
+                ) {
+                    itemsIndexed(
+                        displayEntries.asReversed(),
+                        key = { index, entry ->
+                            when (entry) {
+                                is TimelineDisplayEntry.Message -> entry.key
+                                is TimelineDisplayEntry.ProcessGroup -> entry.key
+                                is TimelineDisplayEntry.TurnFailure -> "failure-${entry.turnId}-$index"
                             }
-                            is TimelineDisplayEntry.ProcessGroup -> {
-                                val timestamp = turn?.startedAtUnixMs?.takeIf { it > 0 }
-                                    ?.let(::formatTimelineTime).orEmpty()
-                                ProcessGroupCard(entry.items, timestamp, connectBelow)
+                        },
+                    ) { index, entry ->
+                        val chronologicalIndex = displayEntries.lastIndex - index
+                        val entryTurnId = entry.timelineTurnId()
+                        val nextTurnId = displayEntries.getOrNull(chronologicalIndex + 1)?.timelineTurnId()
+                        val connectBelow = entryTurnId.isNotBlank() && entryTurnId == nextTurnId
+                        val previousTurnId = displayEntries.getOrNull(chronologicalIndex - 1)?.timelineTurnId()
+                        val turn = turnsById[entryTurnId]
+                        val notices = timelineUiProtocolNotices(
+                            entry,
+                            turn,
+                            entryTurnId != previousTurnId,
+                            importedAtUnixMs,
+                        )
+                        Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            if (notices.isNotEmpty()) ProtocolNoticeText(notices, "timeline-notice-${entry.key}")
+                            when (entry) {
+                                is TimelineDisplayEntry.Message -> {
+                                    val timestamp = when (entry.item.type) {
+                                        "agent_message" -> turn?.completedAtUnixMs?.takeIf { it > 0 }
+                                            ?: turn?.startedAtUnixMs
+                                        else -> turn?.startedAtUnixMs
+                                    }?.takeIf { it > 0 }?.let(::formatTimelineTime).orEmpty()
+                                    TimelineItem(entry.item, timestamp, connectBelow)
+                                }
+                                is TimelineDisplayEntry.ProcessGroup -> {
+                                    val timestamp = turn?.startedAtUnixMs?.takeIf { it > 0 }
+                                        ?.let(::formatTimelineTime).orEmpty()
+                                    ProcessGroupCard(entry.items, timestamp, connectBelow)
+                                }
+                                is TimelineDisplayEntry.TurnFailure -> TurnFailureCard(entry.failure)
                             }
-                            is TimelineDisplayEntry.TurnFailure -> TurnFailureCard(entry.failure)
                         }
                     }
                 }
             }
         }
     }
+}
+
+private fun ConversationTimelineEntry.scrollAnchorKey(index: Int): String = when (this) {
+    is ConversationTimelineEntry.Item -> item.itemId.ifBlank { "${item.turnId}-${item.type}-$index" }
+    is ConversationTimelineEntry.TurnFailure -> "failure-$turnId-$index"
 }
 
 private fun TimelineDisplayEntry.timelineTurnId(): String = when (this) {
@@ -1486,22 +1508,42 @@ internal fun timelineUiProtocolNotices(
     entry: TimelineDisplayEntry,
     turn: ConversationTurn?,
     firstEntryInTurn: Boolean,
+    importedAtUnixMs: Long,
 ): List<String> {
-    val turnNotices = if (firstEntryInTurn) turn?.protocolNotices().orEmpty() else emptyList()
-    val redundantItemProvenanceNotice = when {
-        turn?.provenance?.equals("PROVENANCE_KIND_IMPORTED_HISTORY", ignoreCase = true) == true -> "来自导入的历史记录"
-        turn?.provenance?.equals("PROVENANCE_KIND_HOST_SYNTHESIZED", ignoreCase = true) == true -> "由 Host 重建"
-        else -> null
-    }
+    val turnNotices = if (firstEntryInTurn && turn != null) buildList {
+        turn.completeness?.chineseNotice()?.let(::add)
+        timelineTurnProvenanceNotice(turn, importedAtUnixMs)?.let(::add)
+    } else emptyList()
     val itemNotices = when (entry) {
         is TimelineDisplayEntry.Message -> entry.item.protocolNotices()
         is TimelineDisplayEntry.ProcessGroup -> entry.items.flatMap { it.protocolNotices() }
         is TimelineDisplayEntry.TurnFailure -> emptyList()
     }.filterNot { notice ->
         (entry is TimelineDisplayEntry.Message && notice.startsWith("内容")) ||
-            notice == redundantItemProvenanceNotice
+            notice == "来自导入的历史记录" || notice == "由 Host 重建"
     }
     return (turnNotices + itemNotices).distinct()
+}
+
+internal fun timelineTurnProvenanceNotice(turn: ConversationTurn, importedAtUnixMs: Long): String? {
+    val provenances = buildList {
+        add(turn.provenance)
+        turn.items.mapTo(this) { it.provenance }
+    }
+    if (provenances.any { it.equals("PROVENANCE_KIND_LIVE_WIRE", ignoreCase = true) }) return null
+    val importedHistory = provenances.any {
+        it.equals("PROVENANCE_KIND_IMPORTED_HISTORY", ignoreCase = true)
+    }
+    if (
+        importedHistory && importedAtUnixMs > 0 && turn.startedAtUnixMs > 0 &&
+        turn.startedAtUnixMs < importedAtUnixMs
+    ) {
+        return "此轮来自导入的历史记录"
+    }
+    if (provenances.any { it.equals("PROVENANCE_KIND_HOST_SYNTHESIZED", ignoreCase = true) }) {
+        return "此轮由 Host 重建"
+    }
+    return null
 }
 
 internal sealed interface TimelineDisplayEntry {

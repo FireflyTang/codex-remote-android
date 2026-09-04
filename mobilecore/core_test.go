@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -379,6 +380,25 @@ func (s *blockingRefreshSession) Close() error {
 	return nil
 }
 
+type interleavedRefreshSession struct {
+	fakeSession
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	result    snapshot
+	err       error
+}
+
+func (s *interleavedRefreshSession) Refresh(ctx context.Context) (snapshot, error) {
+	s.startOnce.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return s.result, s.err
+	case <-ctx.Done():
+		return snapshot{}, ctx.Err()
+	}
+}
+
 func (s *fakeSession) Refresh(context.Context) (snapshot, error) { return s.snap, nil }
 func (s *fakeSession) ListHistory(_ context.Context, codexID string) (conversationState, error) {
 	return conversationState{CodexID: codexID, HistoryComplete: true, Turns: []conversationTurn{}}, nil
@@ -623,6 +643,79 @@ func TestStopCancelsBlockingRefreshWithoutWaitingForSessionLock(t *testing.T) {
 	}
 	if final := decodeState(t, c.State()); final.Phase != "stopped" {
 		t.Fatalf("stale refresh overwrote stop: phase=%q", final.Phase)
+	}
+}
+
+func TestRefreshCompletionRestoresCommandIDAfterInterleavedNetworkChange(t *testing.T) {
+	tests := []struct {
+		name      string
+		result    snapshot
+		err       error
+		wantPhase string
+		wantIPs   []string
+		wantHost  string
+	}{
+		{
+			name:      "failure preserves previous network state",
+			err:       errors.New("refresh unavailable"),
+			wantPhase: "error",
+			wantIPs:   []string{"100.64.0.1"},
+			wantHost:  `{"host":{"hostId":"HOST-OLD"}}`,
+		},
+		{
+			name: "success applies refreshed network state",
+			result: snapshot{
+				TailnetIPs: []string{"100.64.0.2"},
+				Host:       json.RawMessage(`{"host":{"hostId":"HOST-NEW"}}`),
+			},
+			wantPhase: "ready",
+			wantIPs:   []string{"100.64.0.2"},
+			wantHost:  `{"host":{"hostId":"HOST-NEW"}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &interleavedRefreshSession{
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+				result:  tt.result,
+				err:     tt.err,
+			}
+			c := NewCore(new(fakePlatform))
+			c.mu.Lock()
+			c.session = sess
+			c.state.Phase = "ready"
+			c.state.Endpoint = "ws://host/connect"
+			c.state.TailnetIPs = []string{"100.64.0.1"}
+			c.state.Host = json.RawMessage(`{"host":{"hostId":"HOST-OLD"}}`)
+			c.mu.Unlock()
+
+			refreshing := decodeState(t, c.Dispatch(`{"version":1,"id":"refresh","type":"refresh"}`))
+			select {
+			case <-sess.started:
+			case <-time.After(time.Second):
+				t.Fatal("refresh did not start")
+			}
+			networkChanged := decodeState(t, c.Dispatch(`{"version":1,"id":"network","type":"network_changed","payload":{"defaultInterface":"wlan0","defaultGateway":"192.168.1.1"}}`))
+			if networkChanged.CommandID != "network" || networkChanged.Phase != "refreshing" || networkChanged.Revision <= refreshing.Revision {
+				t.Fatalf("interleaved network state=%+v, refreshing revision=%d", networkChanged, refreshing.Revision)
+			}
+
+			close(sess.release)
+			waitCommandPhase(t, c, "refresh", tt.wantPhase)
+			c.mu.Lock()
+			final := c.state
+			c.mu.Unlock()
+			if final.Revision <= networkChanged.Revision {
+				t.Fatalf("final revision=%d, want greater than network revision=%d", final.Revision, networkChanged.Revision)
+			}
+			if final.Endpoint != "ws://host/connect" || !slices.Equal(final.TailnetIPs, tt.wantIPs) || string(final.Host) != tt.wantHost {
+				t.Fatalf("final network state endpoint=%q ips=%v host=%s", final.Endpoint, final.TailnetIPs, final.Host)
+			}
+			if tt.err != nil && final.Error != tt.err.Error() {
+				t.Fatalf("final error=%q, want %q", final.Error, tt.err.Error())
+			}
+		})
 	}
 }
 

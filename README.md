@@ -25,18 +25,19 @@
 
 ## 验证范围
 
-最近一次完整自动化基线为：MobileCore Go 全量与 `-race` 通过、JVM 108/108、
-API 36 x86_64 模拟器 connected suite 45/45。模拟器覆盖连接与错误状态、项目目录和
+最近一次完整自动化基线为：MobileCore Go 72 项全量与 `-race` 均通过、JVM 117/117、
+API 36 x86_64 低内存模拟器 connected suite 47/47。模拟器覆盖连接与错误状态、项目目录和
 session 可用性、会话管理、rich timeline、pending request、workspace/SAF 边界、
 诊断导出以及前台恢复状态流。
 
-应用离开前台至少 10 秒后再次回到前台时，会在当前状态允许的情况下，使用已保存的
-Host 地址单次重启连接，并恢复原来打开的会话。运行中的回合、待审批/用户输入和正在
-执行的 UI 操作不会被打断。这里没有后台定时器或循环重连，也不代表应用能在后台长驻。
+应用离开前台至少 10 秒后再次回到前台时，会先单次刷新；刷新失败时，最多执行一次标准
+stop/config/start，并重新选择原来打开的 Codex。运行中的回合、待审批/用户输入和正在
+执行的 UI 操作不会被打断。这里没有后台定时器、循环重连、前台服务、通知或 WakeLock，
+也不代表应用能在后台长驻。
 
-真机已验证内嵌 Tailnet 连接真实 Host、加载会话历史、`StartTurn`、`InterruptTurn`
-以及 arm64 native 库加载。rich timeline、workspace、pending request、SAF 传输、
-前台恢复等后续功能尚未全部在真机联调；模拟器结果不等同于 OriginOS 设备行为。
+vivo X200 Ultra（OriginOS 6）真机已验证内嵌 Tailnet 连接真实 Host、后台 120 秒和
+锁屏 120 秒后均单次恢复原会话、新消息在当前页自动出现、无 request-ID 冲突，以及
+诊断导出。功耗边界检查未发现 service、前台服务、通知或 WakeLock。
 
 当前官方 API 36 x86_64 16 KB system image 不可用，实际 guest page size 为 4096 bytes；
 APK 中 arm64 native ELF 的 `LOAD` segment 对齐为 `0x4000`，且该 native 库已在真机成功加载。
@@ -72,6 +73,9 @@ scripts/android/install.sh
 test package，从而清除模拟器中的 app data 与 Tailnet 授权。需要保留真实 Host
 状态时，应将 connected test 与真实 Host smoke 分开执行。默认 smoke 只读，
 不会发送真实 `StartTurn`；详见 [Android 测试文档](docs/android_testing.md)。
+
+手工运行 `./gradlew` 前先在同一 shell 中执行 `source scripts/android/env.sh`，以复用仓库
+约定的 Android user home 和 debug keystore，避免因使用不同 debug keystore 导致安装失败。
 
 `:app:preBuild` 会通过 `mobilecore/build-aar.sh` 重新生成并校验约定路径
 `mobilecore/build/mobilecore.aar`；该生成产物不会提交到 Git。

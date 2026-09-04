@@ -71,7 +71,7 @@ func TestRetryInitialHostDialRetriesNoHTTPResponseThenSucceeds(t *testing.T) {
 	want := new(protocolClient)
 	attempts := 0
 	waits := 0
-	got, err := retryInitialHostDial(context.Background(), func() (*protocolClient, error) {
+	got, err := retryInitialHostDial(context.Background(), time.Second, func(context.Context) (*protocolClient, error) {
 		attempts++
 		if attempts < 3 {
 			return nil, &hostDialError{status: 0, err: io.EOF}
@@ -97,7 +97,7 @@ func TestRetryInitialHostDialDoesNotRetryHTTPOrProtocolFailure(t *testing.T) {
 	for _, wantErr := range tests {
 		t.Run(wantErr.Error(), func(t *testing.T) {
 			attempts := 0
-			_, err := retryInitialHostDial(context.Background(), func() (*protocolClient, error) {
+			_, err := retryInitialHostDial(context.Background(), time.Second, func(context.Context) (*protocolClient, error) {
 				attempts++
 				return nil, wantErr
 			}, func(context.Context, time.Duration) error {
@@ -114,7 +114,7 @@ func TestRetryInitialHostDialDoesNotRetryHTTPOrProtocolFailure(t *testing.T) {
 func TestRetryInitialHostDialBoundsPersistentTransientFailure(t *testing.T) {
 	attempts := 0
 	waits := 0
-	_, err := retryInitialHostDial(context.Background(), func() (*protocolClient, error) {
+	_, err := retryInitialHostDial(context.Background(), time.Second, func(context.Context) (*protocolClient, error) {
 		attempts++
 		return nil, &hostDialError{status: 0, err: io.EOF}
 	}, func(context.Context, time.Duration) error {
@@ -132,7 +132,7 @@ func TestRetryInitialHostDialBoundsPersistentTransientFailure(t *testing.T) {
 func TestRetryInitialHostDialCancellationStopsDuringWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	attempts := 0
-	_, err := retryInitialHostDial(ctx, func() (*protocolClient, error) {
+	_, err := retryInitialHostDial(ctx, time.Second, func(context.Context) (*protocolClient, error) {
 		attempts++
 		return nil, &hostDialError{status: 0, err: io.EOF}
 	}, func(ctx context.Context, _ time.Duration) error {
@@ -149,7 +149,7 @@ func TestRetryInitialHostDialHonorsExpiredOverallTimeout(t *testing.T) {
 	defer cancel()
 	<-ctx.Done()
 	attempts := 0
-	_, err := retryInitialHostDial(ctx, func() (*protocolClient, error) {
+	_, err := retryInitialHostDial(ctx, time.Second, func(context.Context) (*protocolClient, error) {
 		attempts++
 		return nil, &hostDialError{status: 0, err: io.EOF}
 	}, func(context.Context, time.Duration) error {
@@ -158,5 +158,46 @@ func TestRetryInitialHostDialHonorsExpiredOverallTimeout(t *testing.T) {
 	})
 	if !errors.Is(err, context.DeadlineExceeded) || attempts != 1 {
 		t.Fatalf("error=%v attempts=%d, want deadline after one attempt", err, attempts)
+	}
+}
+
+func TestRetryInitialHostDialRetriesAttemptDeadlineThenSucceeds(t *testing.T) {
+	want := new(protocolClient)
+	attempts := 0
+	waits := 0
+	got, err := retryInitialHostDial(context.Background(), time.Millisecond, func(ctx context.Context) (*protocolClient, error) {
+		attempts++
+		if attempts == 1 {
+			<-ctx.Done()
+			return nil, fmt.Errorf("WebSocket attempt: %w", ctx.Err())
+		}
+		return want, nil
+	}, func(context.Context, time.Duration) error {
+		waits++
+		return nil
+	})
+	if err != nil || got != want {
+		t.Fatalf("retry result=(%p, %v), want=(%p, nil)", got, err, want)
+	}
+	if attempts != 2 || waits != 1 {
+		t.Fatalf("attempts=%d waits=%d, want 2 and 1", attempts, waits)
+	}
+}
+
+func TestRetryInitialHostDialParentCancellationStopsActiveAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	waits := 0
+	_, err := retryInitialHostDial(ctx, time.Second, func(attemptCtx context.Context) (*protocolClient, error) {
+		attempts++
+		cancel()
+		<-attemptCtx.Done()
+		return nil, attemptCtx.Err()
+	}, func(context.Context, time.Duration) error {
+		waits++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || attempts != 1 || waits != 0 {
+		t.Fatalf("error=%v attempts=%d waits=%d, want canceled after one active attempt", err, attempts, waits)
 	}
 }

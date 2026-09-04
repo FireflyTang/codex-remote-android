@@ -31,9 +31,9 @@ class ForegroundRecoveryTest {
     }
 
     @Test
-    fun readyAndIdleDirectlyReconnectOnlyWithSavedEndpoint() {
+    fun readyRefreshesWithoutReconnectAndIdleConnectsOnlyWithSavedEndpoint() {
         assertEquals(
-            ForegroundRecoveryAction.CONNECT,
+            ForegroundRecoveryAction.REFRESH,
             foregroundRecoveryAction(AppUiState(hostAddress = "ws://host/connect", core = CoreState(phase = "ready"))),
         )
         assertEquals(
@@ -41,8 +41,12 @@ class ForegroundRecoveryTest {
             foregroundRecoveryAction(AppUiState(hostAddress = "ws://host/connect", core = CoreState(phase = "idle"))),
         )
         assertEquals(
-            ForegroundRecoveryAction.NONE,
+            ForegroundRecoveryAction.REFRESH,
             foregroundRecoveryAction(AppUiState(hostAddress = " ", core = CoreState(phase = "ready"))),
+        )
+        assertEquals(
+            ForegroundRecoveryAction.NONE,
+            foregroundRecoveryAction(AppUiState(hostAddress = " ", core = CoreState(phase = "idle"))),
         )
         assertEquals(
             listOf("stop", "configure", "start"),
@@ -125,28 +129,32 @@ class ForegroundRecoveryTest {
     }
 
     @Test
-    fun homeReconnectFinishesWhenStartIsReady() {
+    fun homeRefreshFinishesWhenRefreshIsReady() {
         val tracker = ForegroundRecoveryTracker()
-        tracker.begin("start", null)
+        tracker.beginRefresh("refresh", null)
 
         assertEquals(
             ForegroundRecoveryResolution.Finished(null),
-            tracker.onCoreState(CoreState(commandId = "start", phase = "ready")),
+            tracker.onCoreState(CoreState(commandId = "refresh", phase = "ready")),
         )
         assertEquals(
             ForegroundRecoveryResolution.None,
-            tracker.onCoreState(CoreState(commandId = "start", phase = "ready")),
+            tracker.onCoreState(CoreState(commandId = "refresh", phase = "ready")),
         )
     }
 
     @Test
-    fun openConversationReconnectSelectsAndWaitsForMatchingHistory() {
+    fun openConversationRefreshSelectsOnceAndWaitsForMatchingHistory() {
         val tracker = ForegroundRecoveryTracker()
-        tracker.begin("start", "A")
+        tracker.beginRefresh("refresh", "A")
 
         assertEquals(
             ForegroundRecoveryResolution.SelectCodex("A"),
-            tracker.onCoreState(CoreState(commandId = "start", phase = "ready")),
+            tracker.onCoreState(CoreState(commandId = "refresh", phase = "ready")),
+        )
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(CoreState(commandId = "refresh", phase = "ready")),
         )
         tracker.trackSelection("select")
         assertEquals(
@@ -159,35 +167,93 @@ class ForegroundRecoveryTest {
                 CoreState(commandId = "select", phase = "ready", conversation = ConversationState("A")),
             ),
         )
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(
+                CoreState(commandId = "select", phase = "ready", conversation = ConversationState("A")),
+            ),
+        )
     }
 
     @Test
-    fun missingConversationAndSelectionFailureReturnToHome() {
+    fun selectionFailuresRequireManualReconnectWithoutFallback() {
         val missing = ForegroundRecoveryTracker()
-        missing.begin("start", "A")
-        missing.onCoreState(CoreState(commandId = "start", phase = "ready"))
+        missing.beginRefresh("refresh", "A")
+        missing.onCoreState(CoreState(commandId = "refresh", phase = "ready"))
         missing.trackSelection("select")
-        assertTrue(
+        assertEquals(
+            ForegroundRecoveryResolution.Failed("连接已失效，请手动重连"),
             missing.onCoreState(
                 CoreState(commandId = "select", phase = "ready", conversation = ConversationState("B")),
-            ) is ForegroundRecoveryResolution.Failed,
+            ),
         )
 
         val failed = ForegroundRecoveryTracker()
-        failed.begin("start", "A")
-        failed.onCoreState(CoreState(commandId = "start", phase = "ready"))
+        failed.beginRefresh("refresh", "A")
+        failed.onCoreState(CoreState(commandId = "refresh", phase = "ready"))
         failed.trackSelection("select")
         assertEquals(
-            ForegroundRecoveryResolution.Failed("A 不存在"),
+            ForegroundRecoveryResolution.Failed("连接已失效，请手动重连"),
             failed.onCoreState(CoreState(commandId = "select", phase = "error", error = "A 不存在")),
         )
     }
 
     @Test
-    fun duplicateStartNotificationDoesNotRequestAnotherSelection() {
+    fun unrelatedAndDuplicateRefreshNotificationsDoNotRequestAnotherSelection() {
         val tracker = ForegroundRecoveryTracker()
-        tracker.begin("start", "A")
+        tracker.beginRefresh("refresh", "A")
 
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(CoreState(revision = 41, commandId = "old-refresh", phase = "ready")),
+        )
+
+        assertEquals(
+            ForegroundRecoveryResolution.SelectCodex("A"),
+            tracker.onCoreState(CoreState(revision = 43, commandId = "refresh", phase = "ready")),
+        )
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(CoreState(revision = 43, commandId = "refresh", phase = "ready")),
+        )
+    }
+
+    @Test
+    fun timedOutRefreshReconnectsOnceThenSelectsOriginalConversationOnce() {
+        val tracker = ForegroundRecoveryTracker()
+        tracker.beginRefresh("refresh", "A")
+
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(CoreState(revision = 41, commandId = "old-refresh", phase = "error", error = "old")),
+        )
+        assertEquals(
+            ForegroundRecoveryResolution.Reconnect,
+            tracker.onCoreState(
+                CoreState(
+                    revision = 43,
+                    commandId = "refresh",
+                    phase = "error",
+                    error = "GetHost: context deadline exceeded",
+                ),
+            ),
+        )
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(
+                CoreState(
+                    revision = 43,
+                    commandId = "refresh",
+                    phase = "error",
+                    error = "GetHost: context deadline exceeded",
+                ),
+            ),
+        )
+        tracker.trackReconnect("start")
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(CoreState(commandId = "refresh", phase = "error", error = "late refresh failure")),
+        )
         assertEquals(
             ForegroundRecoveryResolution.SelectCodex("A"),
             tracker.onCoreState(CoreState(commandId = "start", phase = "ready")),
@@ -196,6 +262,72 @@ class ForegroundRecoveryTest {
             ForegroundRecoveryResolution.None,
             tracker.onCoreState(CoreState(commandId = "start", phase = "ready")),
         )
+        tracker.trackSelection("select")
+        assertEquals(
+            ForegroundRecoveryResolution.Finished("A"),
+            tracker.onCoreState(
+                CoreState(commandId = "select", phase = "ready", conversation = ConversationState("A")),
+            ),
+        )
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(
+                CoreState(commandId = "select", phase = "ready", conversation = ConversationState("A")),
+            ),
+        )
+    }
+
+    @Test
+    fun reconnectFailureStopsWithoutASecondFallback() {
+        val tracker = ForegroundRecoveryTracker()
+        tracker.beginRefresh("refresh", "A")
+        assertEquals(
+            ForegroundRecoveryResolution.Reconnect,
+            tracker.onCoreState(
+                CoreState(commandId = "refresh", phase = "error", error = "arbitrary refresh failure"),
+            ),
+        )
+        tracker.trackReconnect("start")
+
+        assertEquals(
+            ForegroundRecoveryResolution.Failed("连接已失效，请手动重连"),
+            tracker.onCoreState(CoreState(commandId = "start", phase = "error", error = "Host connection closed")),
+        )
+        assertEquals(
+            ForegroundRecoveryResolution.None,
+            tracker.onCoreState(CoreState(commandId = "start", phase = "error", error = "Host connection closed")),
+        )
+    }
+
+    @Test
+    fun anyForegroundRefreshFailureReconnectsOnceWhenEndpointIsAvailable() {
+        listOf("GetHost: context deadline exceeded", "unexpected refresh response").forEach { error ->
+            val tracker = ForegroundRecoveryTracker()
+            tracker.beginRefresh("refresh", "A")
+            assertEquals(
+                ForegroundRecoveryResolution.Reconnect,
+                tracker.onCoreState(CoreState(commandId = "refresh", phase = "error", error = error)),
+            )
+            assertEquals(
+                ForegroundRecoveryResolution.None,
+                tracker.onCoreState(CoreState(commandId = "refresh", phase = "error", error = error)),
+            )
+        }
+    }
+
+    @Test
+    fun failedRefreshWithoutEndpointNeverFallbacks() {
+        listOf("GetHost: context deadline exceeded", "unexpected refresh response").forEach { error ->
+            val tracker = ForegroundRecoveryTracker()
+            tracker.beginRefresh("refresh", "A")
+            assertEquals(
+                ForegroundRecoveryResolution.Failed("连接已失效，请手动重连"),
+                tracker.onCoreState(
+                    CoreState(commandId = "refresh", phase = "error", error = error),
+                    reconnectAvailable = false,
+                ),
+            )
+        }
     }
 
     @Test

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +40,43 @@ func (c *blockingWriteConnection) Write(ctx context.Context, _ websocket.Message
 }
 
 func (*blockingWriteConnection) CloseNow() error { return nil }
+
+type readAfterWriteConnection struct {
+	wrote   chan struct{}
+	raw     []byte
+	readErr error
+}
+
+func (c *readAfterWriteConnection) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	select {
+	case <-c.wrote:
+		return websocket.MessageText, c.raw, c.readErr
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+}
+
+func (c *readAfterWriteConnection) Write(context.Context, websocket.MessageType, []byte) error {
+	close(c.wrote)
+	return nil
+}
+
+func (*readAfterWriteConnection) CloseNow() error { return nil }
+
+type failingWriteConnection struct {
+	err error
+}
+
+func (c *failingWriteConnection) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	<-ctx.Done()
+	return 0, nil, ctx.Err()
+}
+
+func (c *failingWriteConnection) Write(context.Context, websocket.MessageType, []byte) error {
+	return c.err
+}
+
+func (*failingWriteConnection) CloseNow() error { return nil }
 
 func TestProtocolHandshakeGetHostListCodexesAndPing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +138,204 @@ func TestProtocolHandshakeGetHostListCodexesAndPing(t *testing.T) {
 	}
 	if len(host) == 0 || len(codexes) == 0 {
 		t.Fatalf("empty snapshot host=%s codexes=%s", host, codexes)
+	}
+}
+
+func TestRequestIDsAreUniqueAcrossConnectionsWithSameClientRunID(t *testing.T) {
+	type observation struct {
+		connection int
+		runID      string
+		ids        []string
+	}
+	observations := make(chan observation, 2)
+	var connectionSequence atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{WebSocketSubprotocol}})
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		hello := readTestFrame(t, ctx, conn).GetClientHello()
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		seen := observation{connection: int(connectionSequence.Add(1)), runID: hello.GetClientRunId()}
+		for i := 0; i < 2; i++ {
+			req := readTestFrame(t, ctx, conn).GetRequest()
+			if req == nil || req.GetGetHost() == nil {
+				t.Errorf("expected GetHost request, got %v", req)
+				return
+			}
+			seen.ids = append(seen.ids, req.GetRequestId())
+			writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{
+				RequestId: req.GetRequestId(),
+				Result: &remotev1.Response_GetHost{GetHost: &remotev1.GetHostResponse{
+					Host:         &remotev1.HostInfo{HostId: req.GetRequestId()},
+					Capabilities: &remotev1.Capabilities{},
+				}},
+			}}})
+		}
+		observations <- seen
+	}))
+	defer server.Close()
+	addr := server.Listener.Addr().String()
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const runID = "00000000-0000-4000-8000-000000000001"
+	prefixes := []string{
+		protocolRequestIDPrefixWithNonce(runID, []byte("connection-one")),
+		protocolRequestIDPrefixWithNonce(runID, []byte("connection-two")),
+	}
+	clients := make([]*protocolClient, 0, 2)
+	for _, prefix := range prefixes {
+		client, err := dialProtocolWithRequestIDPrefix(
+			ctx,
+			configPayload{HostEndpoint: "fake-host", ClientID: "stable-client", ClientRunID: runID},
+			dial,
+			prefix,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+		defer client.Close()
+		for i := 0; i < 2; i++ {
+			req := &remotev1.Request{Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}}}
+			resp, err := client.call(ctx, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.GetRequestId() != req.GetRequestId() || resp.GetGetHost().GetHost().GetHostId() != req.GetRequestId() {
+				t.Fatalf("response was not paired to request %q: %v", req.GetRequestId(), resp)
+			}
+		}
+	}
+
+	byConnection := map[int]observation{}
+	for i := 0; i < 2; i++ {
+		seen := <-observations
+		byConnection[seen.connection] = seen
+	}
+	first, second := byConnection[1].ids, byConnection[2].ids
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("observed IDs: %#v", byConnection)
+	}
+	if first[0] == second[0] {
+		t.Fatalf("first request ID collided across connections: %q", first[0])
+	}
+	if first[0] != prefixes[0]+"-1" || first[1] != prefixes[0]+"-2" {
+		t.Fatalf("first connection IDs do not increment: %q", first)
+	}
+	if second[0] != prefixes[1]+"-1" || second[1] != prefixes[1]+"-2" {
+		t.Fatalf("second connection IDs do not increment: %q", second)
+	}
+	if byConnection[1].runID != runID || byConnection[2].runID != runID {
+		t.Fatalf("ClientRunID changed across dials: %#v", byConnection)
+	}
+	for _, id := range append(first, second...) {
+		if len(id) > 53 || strings.Contains(id, runID) {
+			t.Fatalf("request ID is unbounded or exposes client run ID: %q", id)
+		}
+	}
+}
+
+func TestConcurrentCallsHaveUniqueIDsAndMatchOutOfOrderResponses(t *testing.T) {
+	const callCount = 24
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{WebSocketSubprotocol}})
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		_ = readTestFrame(t, ctx, conn).GetClientHello()
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		requests := make([]*remotev1.Request, 0, callCount)
+		for i := 0; i < callCount; i++ {
+			req := readTestFrame(t, ctx, conn).GetRequest()
+			if req == nil || req.GetGetHost() == nil {
+				t.Errorf("expected GetHost request, got %v", req)
+				return
+			}
+			requests = append(requests, req)
+		}
+		for i := len(requests) - 1; i >= 0; i-- {
+			req := requests[i]
+			writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{
+				RequestId: req.GetRequestId(),
+				Result: &remotev1.Response_GetHost{GetHost: &remotev1.GetHostResponse{
+					Host:         &remotev1.HostInfo{HostId: req.GetRequestId()},
+					Capabilities: &remotev1.Capabilities{},
+				}},
+			}}})
+		}
+	}))
+	defer server.Close()
+	addr := server.Listener.Addr().String()
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := dialProtocolWithRequestIDPrefix(
+		ctx,
+		configPayload{HostEndpoint: "fake-host", ClientID: "client", ClientRunID: "same-run"},
+		dial,
+		protocolRequestIDPrefixWithNonce("same-run", []byte("fixed-connection")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	type callResult struct {
+		requestID string
+		response  *remotev1.Response
+		err       error
+	}
+	results := make(chan callResult, callCount)
+	for i := 0; i < callCount; i++ {
+		go func() {
+			req := &remotev1.Request{Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}}}
+			resp, err := client.call(ctx, req)
+			results <- callResult{requestID: req.GetRequestId(), response: resp, err: err}
+		}()
+	}
+	seen := make(map[string]struct{}, callCount)
+	for i := 0; i < callCount; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if _, duplicate := seen[result.requestID]; duplicate {
+			t.Fatalf("duplicate concurrent request ID %q", result.requestID)
+		}
+		seen[result.requestID] = struct{}{}
+		if result.response.GetRequestId() != result.requestID ||
+			result.response.GetGetHost().GetHost().GetHostId() != result.requestID {
+			t.Fatalf("response mismatch for %q: %v", result.requestID, result.response)
+		}
+	}
+}
+
+func TestFallbackRequestNoncesAreUniqueConcurrently(t *testing.T) {
+	const count = 128
+	nonces := make(chan string, count)
+	for i := 0; i < count; i++ {
+		go func() { nonces <- string(protocolRequestFallbackNonce()) }()
+	}
+	seen := make(map[string]struct{}, count)
+	for i := 0; i < count; i++ {
+		nonce := <-nonces
+		if _, duplicate := seen[nonce]; duplicate {
+			t.Fatalf("duplicate fallback nonce %q", nonce)
+		}
+		seen[nonce] = struct{}{}
 	}
 }
 
@@ -887,6 +1124,90 @@ func TestCallCancellationInterruptsBlockingWrite(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("canceled call remained blocked in Write")
+	}
+}
+
+func TestReadLoopEOFWakesPendingCallWithStableClosedError(t *testing.T) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	conn := &readAfterWriteConnection{wrote: make(chan struct{}), readErr: io.EOF}
+	client := &protocolClient{
+		conn: conn, hello: completeServerHello(2), requestIDPrefix: "test-connection",
+		ctx: runCtx, cancel: runCancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{},
+	}
+	go client.readLoop()
+
+	_, err := client.call(context.Background(), &remotev1.Request{
+		Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}},
+	})
+	if !errors.Is(err, errHostConnectionClosed) || err.Error() != "Host connection closed" {
+		t.Fatalf("call error=%v, want stable Host connection closed", err)
+	}
+}
+
+func TestClientCanceledWriteReturnsStableClosedError(t *testing.T) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	client := &protocolClient{
+		conn: &blockingWriteConnection{started: make(chan struct{})},
+		ctx:  runCtx, cancel: runCancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{},
+	}
+	runCancel()
+	err := client.write(context.Background(), &remotev1.Frame{
+		Payload: &remotev1.Frame_Request{Request: &remotev1.Request{
+			Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}},
+		}},
+	})
+	if !errors.Is(err, errHostConnectionClosed) || err.Error() != "Host connection closed" {
+		t.Fatalf("write error=%v, want stable Host connection closed", err)
+	}
+}
+
+func TestBrokenPipeWriteReturnsStableClosedError(t *testing.T) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	client := &protocolClient{
+		conn: &failingWriteConnection{err: io.ErrClosedPipe},
+		ctx:  runCtx, cancel: runCancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{},
+	}
+	err := client.write(context.Background(), &remotev1.Frame{
+		Payload: &remotev1.Frame_Request{Request: &remotev1.Request{
+			Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}},
+		}},
+	})
+	if !errors.Is(err, errHostConnectionClosed) || err.Error() != "Host connection closed" {
+		t.Fatalf("write error=%v, want stable Host connection closed", err)
+	}
+}
+
+func TestCallerCancellationWinsOverClosedClient(t *testing.T) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	client := &protocolClient{
+		conn: &blockingWriteConnection{started: make(chan struct{})},
+		ctx:  runCtx, cancel: runCancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{},
+	}
+	callCtx, callCancel := context.WithCancel(context.Background())
+	callCancel()
+	runCancel()
+	err := client.write(callCtx, &remotev1.Frame{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("write error=%v, want caller context cancellation", err)
+	}
+}
+
+func TestNonClosingProtocolErrorIsNotNormalizedToClosed(t *testing.T) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	conn := &readAfterWriteConnection{wrote: make(chan struct{}), raw: []byte("not-json")}
+	client := &protocolClient{
+		conn: conn, hello: completeServerHello(2), requestIDPrefix: "test-connection",
+		ctx: runCtx, cancel: runCancel, writeGate: newWriteGate(), pending: map[string]chan responseResult{},
+	}
+	go client.readLoop()
+
+	_, err := client.call(context.Background(), &remotev1.Request{
+		Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}},
+	})
+	if err == nil || errors.Is(err, errHostConnectionClosed) || !strings.Contains(err.Error(), "decode Host frame") {
+		t.Fatalf("call error=%v, want original protocol decode error", err)
 	}
 }
 

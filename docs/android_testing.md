@@ -41,6 +41,11 @@ Extra Gradle arguments replace the default task, for example:
 scripts/android/build.sh :app:assembleRelease
 ```
 
+Before invoking `./gradlew` manually, run `source scripts/android/env.sh` in the
+same shell. This keeps the repository's Android user home and debug keystore in
+use, avoiding install failures caused by signing debug builds with a different
+debug keystore.
+
 The AVD is a resource-conscious approximation of a vivo X200 Ultra: API 36,
 x86_64, 1080x2400 at 420 dpi, 2 cores, 2 GiB RAM, and a 256 MiB VM heap. The
 existing data-partition setting is left unchanged. This is not a vendor
@@ -59,23 +64,26 @@ The running guest reported a 4096-byte page size. The packaged arm64
 successfully on the tested physical device, but neither fact substitutes for a
 test on a 16 KB guest.
 
-The latest complete baseline passed MobileCore's normal and race-enabled Go
-tests, 108/108 JVM tests, and 45/45 connected tests on the standard API 36 AVD.
+The latest complete baseline passed all 72 MobileCore Go tests in both normal
+and race-enabled runs, 117/117 JVM tests, and 47/47 connected tests on the
+low-memory API 36 AVD.
 The emulator suite covers connection/error presentation, project and session
 states, session management, rich timeline rendering, pending approval/user
 input, workspace and SAF boundaries, diagnostic export, and foreground recovery.
 
 Foreground recovery is deliberately bounded. After the app has been in the
-background for at least 10 seconds, returning to the foreground may restart the
-saved connection once and reselect the previously open Codex session. It does
-not interrupt a running turn, pending interaction, or active UI operation, and
-there is no background timer or reconnect loop.
+background for at least 10 seconds, returning to the foreground first performs
+one refresh. Only if that refresh fails, it performs at most one standard
+stop/config/start and reselects the previously open Codex. It does not interrupt
+a running turn, pending interaction, or active UI operation. There is no
+background timer, reconnect loop, foreground service, notification, or WakeLock.
 
-A physical device has been used against a real Tailnet and Host to verify
-connection, conversation history, `StartTurn`, and `InterruptTurn`. The later
-timeline, workspace, pending-request, SAF, diagnostic-export, and foreground-
-recovery flows have not all been revalidated on the physical device. Emulator
-coverage does not establish vivo OriginOS background behavior.
+A vivo X200 Ultra running OriginOS 6 has been tested against a real Tailnet and
+Host. Returning after 120 seconds in the background and after 120 seconds with
+the screen locked each recovered the original session once; new messages
+appeared automatically on the current page. The same validation found no
+request-ID conflict and verified diagnostic export. Its power-boundary check
+found no service, foreground service, notification, or WakeLock.
 
 ### Connected-test data warning
 
