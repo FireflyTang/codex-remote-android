@@ -1,6 +1,8 @@
 package com.firefly.codexremote
 
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -11,14 +13,101 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.unit.dp
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
 class TimelineItemTest {
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun userMessageIsRightAlignedAndAssistantMessageIsLeftAligned() {
+        compose.setContent {
+            MaterialTheme {
+                Column(Modifier.fillMaxSize()) {
+                    TimelineItem(
+                        ConversationItem(
+                            itemId = "user",
+                            turnId = "turn",
+                            type = "user_message",
+                            status = "completed",
+                            userMessage = UserMessageItem(listOf("请检查项目"), "请检查项目"),
+                        ),
+                        timestamp = "10:30",
+                        connectBelow = true,
+                    )
+                    TimelineItem(
+                        ConversationItem(
+                            itemId = "assistant",
+                            turnId = "turn",
+                            type = "agent_message",
+                            status = "completed",
+                            agentMessage = AgentMessageItem("已经完成检查。"),
+                        ),
+                        timestamp = "10:31",
+                    )
+                }
+            }
+        }
+
+        val userAvatar = compose.onNodeWithTag("message-avatar-user").fetchSemanticsNode().boundsInRoot
+        val userBubble = compose.onNodeWithTag("message-bubble-user").fetchSemanticsNode().boundsInRoot
+        val assistantAvatar = compose.onNodeWithTag("message-avatar-assistant").fetchSemanticsNode().boundsInRoot
+        val assistantBubble = compose.onNodeWithTag("message-bubble-assistant").fetchSemanticsNode().boundsInRoot
+
+        assertTrue(userAvatar.left >= userBubble.right)
+        assertTrue(assistantAvatar.right <= assistantBubble.left)
+        assertTrue(userBubble.left > assistantBubble.left)
+        compose.onNodeWithText("请检查项目").assertIsDisplayed()
+        compose.onNodeWithText("已经完成检查。").assertIsDisplayed()
+        compose.onNodeWithText("10:30").assertIsDisplayed()
+        compose.onNodeWithText("10:31").assertIsDisplayed()
+    }
+
+    @Test
+    fun longMessagesStayInsideTheirBubblesOnANarrowScreen() {
+        val longUserText = "请检查这个很长的项目说明，并保留所有重要上下文和完整的错误信息。".repeat(4)
+        val longAssistantText = "已完成 **详细检查**，下面给出完整结果和后续建议。".repeat(6)
+        compose.setContent {
+            MaterialTheme {
+                Column(Modifier.width(280.dp)) {
+                    TimelineItem(
+                        ConversationItem(
+                            itemId = "long-user",
+                            turnId = "turn",
+                            type = "user_message",
+                            status = "completed",
+                            userMessage = UserMessageItem(listOf(longUserText), longUserText),
+                        ),
+                    )
+                    TimelineItem(
+                        ConversationItem(
+                            itemId = "long-assistant",
+                            turnId = "turn",
+                            type = "agent_message",
+                            status = "completed",
+                            agentMessage = AgentMessageItem(longAssistantText),
+                        ),
+                    )
+                }
+            }
+        }
+
+        val userRow = compose.onNodeWithTag("message-row-user").fetchSemanticsNode().boundsInRoot
+        val userBubble = compose.onNodeWithTag("message-bubble-user").fetchSemanticsNode().boundsInRoot
+        val assistantRow = compose.onNodeWithTag("message-row-assistant").fetchSemanticsNode().boundsInRoot
+        val assistantBubble = compose.onNodeWithTag("message-bubble-assistant").fetchSemanticsNode().boundsInRoot
+
+        assertTrue(userBubble.left >= userRow.left && userBubble.right <= userRow.right)
+        assertTrue(assistantBubble.left >= assistantRow.left && assistantBubble.right <= assistantRow.right)
+        assertTrue(userBubble.width <= userRow.width * 0.8f)
+        assertTrue(assistantBubble.width <= assistantRow.width * 0.8f)
+    }
 
     @Test
     fun completedReasoningIsCollapsedUntilTapped() {

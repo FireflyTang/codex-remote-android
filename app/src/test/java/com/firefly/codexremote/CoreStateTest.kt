@@ -96,6 +96,7 @@ class CoreStateTest {
               }]},
               "conversation":{"codexId":"C","turns":[{
                 "turnId":"T1", "status":"completed", "startedAtUnixMs":1, "completedAtUnixMs":2,
+                "causedByCommandId":"start-1",
                 "completeness":{"incomplete":true,"originalSizeBytes":800,"reason":"gap"},
                 "provenance":"PROVENANCE_KIND_IMPORTED_HISTORY",
                 "items":[{
@@ -126,6 +127,7 @@ class CoreStateTest {
         assertEquals(listOf("内容已截断且不完整", "历史记录导入不完整"), candidate.protocolNotices())
 
         val turn = state.conversation!!.turns.single()
+        assertEquals("start-1", turn.causedByCommandId)
         assertEquals(listOf("内容不完整", "此轮来自导入的历史记录"), turn.protocolNotices())
         assertEquals(listOf("内容已截断", "由 Host 重建"), turn.items.single().protocolNotices())
     }

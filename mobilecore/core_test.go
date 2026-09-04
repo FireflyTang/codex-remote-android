@@ -296,7 +296,7 @@ func (s *conversationFakeSession) ListHistory(ctx context.Context, codexID strin
 	history.CodexID = codexID
 	return history, nil
 }
-func (s *conversationFakeSession) StartTurn(_ context.Context, _ string, text string, options *turnOptionsPayload) (string, error) {
+func (s *conversationFakeSession) StartTurn(_ context.Context, _, _ string, text string, options *turnOptionsPayload) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.startCalls++
@@ -353,7 +353,7 @@ func (s *blockingRefreshSession) ListHistory(ctx context.Context, _ string) (con
 	<-ctx.Done()
 	return conversationState{}, ctx.Err()
 }
-func (s *blockingRefreshSession) StartTurn(context.Context, string, string, *turnOptionsPayload) (string, error) {
+func (s *blockingRefreshSession) StartTurn(context.Context, string, string, string, *turnOptionsPayload) (string, error) {
 	return "", nil
 }
 func (s *blockingRefreshSession) InterruptTurn(context.Context, string, string) (string, error) {
@@ -403,7 +403,7 @@ func (s *fakeSession) Refresh(context.Context) (snapshot, error) { return s.snap
 func (s *fakeSession) ListHistory(_ context.Context, codexID string) (conversationState, error) {
 	return conversationState{CodexID: codexID, HistoryComplete: true, Turns: []conversationTurn{}}, nil
 }
-func (s *fakeSession) StartTurn(context.Context, string, string, *turnOptionsPayload) (string, error) {
+func (s *fakeSession) StartTurn(context.Context, string, string, string, *turnOptionsPayload) (string, error) {
 	return "TURN-1", nil
 }
 func (s *fakeSession) InterruptTurn(context.Context, string, string) (string, error) {

@@ -149,7 +149,27 @@ func rebuildTurnMessages(turn *conversationTurn) {
 	}
 }
 
+func mergeConversationItemsByID(items []conversationItem) []conversationItem {
+	out := make([]conversationItem, 0, len(items))
+	byID := make(map[string]int, len(items))
+	for _, item := range items {
+		if index, ok := byID[item.ItemID]; ok && item.ItemID != "" {
+			out[index] = mergeConversationItem(out[index], item)
+			continue
+		}
+		out = append(out, item)
+		if item.ItemID != "" {
+			byID[item.ItemID] = len(out) - 1
+		}
+	}
+	return out
+}
+
 func mergeConversationTurn(left, right conversationTurn) conversationTurn {
+	if len(right.Items) > 0 {
+		right.Items = mergeConversationItemsByID(right.Items)
+		rebuildTurnMessages(&right)
+	}
 	if left.TurnID == "" {
 		return right
 	}
@@ -169,19 +189,95 @@ func mergeConversationTurn(left, right conversationTurn) conversationTurn {
 	if out.Provenance == "" {
 		out.Provenance = left.Provenance
 	}
+	if out.CausedByCommandID == "" {
+		out.CausedByCommandID = left.CausedByCommandID
+	}
+	out.LiveFromStart = left.LiveFromStart || right.LiveFromStart
 	out.Completeness = mergeCompleteness(left.Completeness, out.Completeness)
 	byID := make(map[string]int, len(out.Items))
 	for i := range out.Items {
-		byID[out.Items[i].ItemID] = i
+		if out.Items[i].ItemID != "" {
+			byID[out.Items[i].ItemID] = i
+		}
 	}
-	for _, item := range left.Items {
+	for _, item := range mergeConversationItemsByID(left.Items) {
 		if index, ok := byID[item.ItemID]; ok && item.ItemID != "" {
 			out.Items[index] = mergeConversationItem(item, out.Items[index])
 		} else {
 			out.Items = append(out.Items, item)
+			if item.ItemID != "" {
+				byID[item.ItemID] = len(out.Items) - 1
+			}
 		}
 	}
+	if len(out.Items) > 0 {
+		rebuildTurnMessages(&out)
+	}
+	return out
+}
+
+func continuousLiveTurnProjection(turn conversationTurn) bool {
+	if !turn.LiveFromStart || (turn.Completeness != nil && (turn.Completeness.Incomplete || turn.Completeness.Truncated)) {
+		return false
+	}
+	for _, item := range turn.Items {
+		if item.Provenance != remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE.String() || (item.Completeness != nil && (item.Completeness.Incomplete || item.Completeness.Truncated)) {
+			return false
+		}
+	}
+	return true
+}
+
+func completeLiveTurnProjection(turn conversationTurn) bool {
+	if !continuousLiveTurnProjection(turn) || !terminalTurnStatus(turn.Status) || len(turn.Items) == 0 {
+		return false
+	}
+	for _, item := range turn.Items {
+		if !terminalItemStatus(item.Status) {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeContinuousLiveTurnProjection(live, history conversationTurn) conversationTurn {
+	out := mergeConversationTurn(live, history)
+	historyByID := make(map[string]conversationItem, len(history.Items))
+	for _, item := range mergeConversationItemsByID(history.Items) {
+		if item.ItemID != "" {
+			historyByID[item.ItemID] = item
+		}
+	}
+	out.Items = mergeConversationItemsByID(live.Items)
+	for i := range out.Items {
+		if historyItem, ok := historyByID[out.Items[i].ItemID]; ok {
+			// Keep the realtime identity/provenance authoritative while allowing
+			// a finalized history snapshot with the same protocol ID to fill data.
+			out.Items[i] = mergeConversationItem(historyItem, out.Items[i])
+		}
+	}
+	out.LiveFromStart = true
 	rebuildTurnMessages(&out)
+	return out
+}
+
+func mergeConversationTurnsByID(turns []conversationTurn) []conversationTurn {
+	out := make([]conversationTurn, 0, len(turns))
+	byID := make(map[string]int, len(turns))
+	for _, turn := range turns {
+		if len(turn.Items) > 0 {
+			turn.Items = mergeConversationItemsByID(turn.Items)
+			rebuildTurnMessages(&turn)
+		}
+		if index, ok := byID[turn.TurnID]; ok && turn.TurnID != "" {
+			out[index] = mergeConversationTurn(out[index], turn)
+			continue
+		}
+		out = append(out, turn)
+		if turn.TurnID != "" {
+			byID[turn.TurnID] = len(out) - 1
+		}
+	}
 	return out
 }
 
@@ -189,15 +285,28 @@ func mergeConversationTurn(left, right conversationTurn) conversationTurn {
 // newer live suffix that history has not materialized yet.
 func mergeConversationSnapshot(live, history conversationState) conversationState {
 	out := history
+	out.Turns = mergeConversationTurnsByID(out.Turns)
 	byID := make(map[string]int, len(out.Turns))
 	for i := range out.Turns {
-		byID[out.Turns[i].TurnID] = i
+		if out.Turns[i].TurnID != "" {
+			byID[out.Turns[i].TurnID] = i
+		}
 	}
-	for _, turn := range live.Turns {
+	for _, turn := range mergeConversationTurnsByID(live.Turns) {
 		if index, ok := byID[turn.TurnID]; ok && turn.TurnID != "" {
-			out.Turns[index] = mergeConversationTurn(turn, out.Turns[index])
+			if completeLiveTurnProjection(turn) || (turn.Status == "running" && continuousLiveTurnProjection(turn)) {
+				// ListHistory may expose a different ItemID projection for the same
+				// stable TurnID. Preserve a continuous live identity lineage while it
+				// is running so imported IDs cannot poison terminal reconciliation.
+				out.Turns[index] = mergeContinuousLiveTurnProjection(turn, out.Turns[index])
+			} else {
+				out.Turns[index] = mergeConversationTurn(turn, out.Turns[index])
+			}
 		} else {
 			out.Turns = append(out.Turns, turn)
+			if turn.TurnID != "" {
+				byID[turn.TurnID] = len(out.Turns) - 1
+			}
 		}
 	}
 	out.PendingRequests = append([]pendingRequest{}, live.PendingRequests...)
@@ -254,6 +363,7 @@ func (c *Core) finishConversationPollFromWatchLocked(turnID string) {
 	c.pollCancel()
 	c.pollCancel = nil
 	c.conversationPollTurnID = ""
+	c.conversationStartCommandID = ""
 	if c.interruptTurnID == turnID {
 		c.interruptTurnID = ""
 	}
@@ -295,7 +405,11 @@ func (c *Core) applyWatchResetLocked(start pendingWatchReset) {
 	if c.conversationPollTurnID != "" && c.conversationPollTurnID != start.ActiveTurn.TurnID {
 		c.finishConversationPollFromWatchLocked(c.conversationPollTurnID)
 	}
-	c.upsertWatchTurnLocked(*start.ActiveTurn)
+	activeTurn := c.upsertWatchTurnLocked(*start.ActiveTurn)
+	// A RESET snapshot may start in the middle of a turn. Even if every item
+	// currently present is LIVE_WIRE, only history can prove whether earlier
+	// items are missing.
+	activeTurn.LiveFromStart = false
 	c.state.Conversation.ActiveTurnID = start.ActiveTurn.TurnID
 	c.state.Conversation.Running = start.ActiveTurn.Status == "running"
 	c.watchChunks = map[string]watchChunkState{}
@@ -323,6 +437,61 @@ func ensureWatchTurn(conversation *conversationState, turnID string) *conversati
 	}
 	conversation.Turns = append(conversation.Turns, conversationTurn{TurnID: turnID, Status: "running", Items: []conversationItem{}, Messages: []conversationMessage{}})
 	return &conversation.Turns[len(conversation.Turns)-1]
+}
+
+func (c *Core) issueConversationStartCommandLocked(commandID string) {
+	c.conversationStartCommandID = commandID
+	if c.conversationStartCommandIDs == nil {
+		c.conversationStartCommandIDs = map[string]struct{}{}
+	}
+	c.conversationStartCommandIDs[commandID] = struct{}{}
+}
+
+func (c *Core) discardConversationStartCommandLocked(commandID string) {
+	delete(c.conversationStartCommandIDs, commandID)
+	if c.conversationStartCommandID == commandID {
+		c.conversationStartCommandID = ""
+	}
+}
+
+func (c *Core) clearConversationStartCommandsLocked() {
+	c.conversationStartCommandID = ""
+	c.conversationStartCommandIDs = nil
+}
+
+func (c *Core) consumeConversationStartCommandLocked(commandID string) bool {
+	if commandID == "" {
+		return false
+	}
+	if _, ok := c.conversationStartCommandIDs[commandID]; !ok {
+		return false
+	}
+	c.discardConversationStartCommandLocked(commandID)
+	return true
+}
+
+func startCausalLiveTurn(turn *conversationTurn, requestID string) {
+	if requestID == "" {
+		return
+	}
+	turn.CausedByCommandID = requestID
+	turn.Status = "running"
+	turn.CompletedAtUnixMS = 0
+	turn.Failure = ""
+	turn.Completeness = nil
+	turn.Provenance = remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE.String()
+	// StartTurn's causal running event precedes this turn's item stream. Polling
+	// may already have inserted an imported projection with different ItemIDs;
+	// remove only that projection so subsequent live identities start cleanly.
+	liveItems := turn.Items[:0]
+	for _, item := range turn.Items {
+		if item.Provenance != remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY.String() {
+			liveItems = append(liveItems, item)
+		}
+	}
+	turn.Items = liveItems
+	rebuildTurnMessages(turn)
+	turn.LiveFromStart = true
 }
 
 func (c *Core) applyWatchEventLocked(event pendingWatchEvent) error {
@@ -367,6 +536,9 @@ func (c *Core) applyWatchEventLocked(event pendingWatchEvent) error {
 			turn.Failure = update.Failure.Message
 		}
 		if status == "running" {
+			if c.consumeConversationStartCommandLocked(raw.CausedByRequestId) {
+				startCausalLiveTurn(turn, raw.CausedByRequestId)
+			}
 			if c.state.Conversation.SuppressedActiveTurnIDs != nil {
 				delete(c.state.Conversation.SuppressedActiveTurnIDs, update.TurnId)
 			}

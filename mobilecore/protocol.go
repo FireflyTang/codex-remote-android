@@ -823,7 +823,7 @@ func (c *protocolClient) ListHistory(ctx context.Context, codexID string) (conve
 	return conversation, nil
 }
 
-func (c *protocolClient) StartTurn(ctx context.Context, codexID, text string, options *turnOptionsPayload) (string, error) {
+func (c *protocolClient) StartTurn(ctx context.Context, commandID, codexID, text string, options *turnOptionsPayload) (string, error) {
 	req := &remotev1.StartTurnRequest{
 		CodexId: codexID,
 		Input:   []*remotev1.UserInputPart{{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: text}}}},
@@ -831,7 +831,7 @@ func (c *protocolClient) StartTurn(ctx context.Context, codexID, text string, op
 	if options != nil {
 		req.Options = &remotev1.TurnOptions{Model: options.Model, Mode: options.Mode, ApprovalPolicy: options.ApprovalPolicy, ReasoningEffort: options.ReasoningEffort}
 	}
-	resp, err := c.call(ctx, &remotev1.Request{Request: &remotev1.Request_StartTurn{StartTurn: req}})
+	resp, err := c.callWithRequestID(ctx, commandID, &remotev1.Request{Request: &remotev1.Request_StartTurn{StartTurn: req}})
 	if err != nil {
 		return "", fmt.Errorf("StartTurn: %w", err)
 	}
@@ -1373,7 +1373,10 @@ func hostError(method string, e *remotev1.Error) error {
 }
 
 func (c *protocolClient) call(ctx context.Context, req *remotev1.Request) (*remotev1.Response, error) {
-	sequence := c.sequence.Add(1)
+	return c.callWithRequestID(ctx, "", req)
+}
+
+func (c *protocolClient) callWithRequestID(ctx context.Context, requestID string, req *remotev1.Request) (*remotev1.Response, error) {
 	ch := make(chan responseResult, 1)
 	c.mu.Lock()
 	if c.closed {
@@ -1383,17 +1386,23 @@ func (c *protocolClient) call(ctx context.Context, req *remotev1.Request) (*remo
 	if c.requestIDPrefix == "" {
 		c.requestIDPrefix = protocolRequestIDPrefix("")
 	}
-	id := fmt.Sprintf("%s-%d", c.requestIDPrefix, sequence)
-	c.pending[id] = ch
+	if requestID == "" {
+		requestID = fmt.Sprintf("%s-%d", c.requestIDPrefix, c.sequence.Add(1))
+	}
+	if _, exists := c.pending[requestID]; exists {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("duplicate in-flight request ID %q", requestID)
+	}
+	c.pending[requestID] = ch
 	c.mu.Unlock()
-	req.RequestId = id
+	req.RequestId = requestID
 	req.SentAtUnixMs = time.Now().UnixMilli()
 	if deadline, ok := ctx.Deadline(); ok {
 		req.DeadlineUnixMs = deadline.UnixMilli()
 	}
 	if err := c.write(ctx, &remotev1.Frame{Payload: &remotev1.Frame_Request{Request: req}}); err != nil {
 		c.mu.Lock()
-		delete(c.pending, id)
+		delete(c.pending, requestID)
 		c.mu.Unlock()
 		return nil, err
 	}
@@ -1405,7 +1414,7 @@ func (c *protocolClient) call(ctx context.Context, req *remotev1.Request) (*remo
 		return result.response, result.err
 	case <-ctx.Done():
 		c.mu.Lock()
-		delete(c.pending, id)
+		delete(c.pending, requestID)
 		c.mu.Unlock()
 		return nil, ctx.Err()
 	case <-c.ctx.Done():

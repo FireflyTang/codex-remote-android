@@ -423,8 +423,10 @@ type conversationTurn struct {
 	Failure           string                    `json:"failure,omitempty"`
 	Completeness      *conversationCompleteness `json:"completeness,omitempty"`
 	Provenance        string                    `json:"provenance,omitempty"`
+	CausedByCommandID string                    `json:"causedByCommandId,omitempty"`
 	Items             []conversationItem        `json:"items"`
 	Messages          []conversationMessage     `json:"messages"`
+	LiveFromStart     bool                      `json:"-"`
 }
 
 type conversationState struct {
@@ -467,7 +469,7 @@ type state struct {
 type session interface {
 	Refresh(context.Context) (snapshot, error)
 	ListHistory(context.Context, string) (conversationState, error)
-	StartTurn(context.Context, string, string, *turnOptionsPayload) (string, error)
+	StartTurn(context.Context, string, string, string, *turnOptionsPayload) (string, error)
 	InterruptTurn(context.Context, string, string) (string, error)
 	ListDirectories(context.Context, string) (directoryListing, error)
 	ListSessionCandidates(context.Context, string) (sessionCandidatesState, error)
@@ -554,29 +556,31 @@ func (n *stateNotifier) run() {
 
 // Core is safe for calls from Android lifecycle and UI threads.
 type Core struct {
-	mu                      sync.Mutex
-	platform                Platform
-	starter                 starter
-	config                  *configPayload
-	state                   state
-	cancel                  context.CancelFunc
-	pollCancel              context.CancelFunc
-	conversationPollTurnID  string
-	session                 session
-	runID                   uint64
-	conversationRunID       uint64
-	conversationPollTimeout time.Duration
-	interruptTurnID         string
-	workspaceCancel         context.CancelFunc
-	workspaceRunID          uint64
-	workspaceUploadInFlight bool
-	pendingWatchCancel      context.CancelFunc
-	pendingWatchDone        chan struct{}
-	pendingWatchRunID       uint64
-	pendingResponseCancels  map[string]context.CancelFunc
-	pendingRequestLocal     map[string]pendingLocalState
-	watchChunks             map[string]watchChunkState
-	notifier                *stateNotifier
+	mu                          sync.Mutex
+	platform                    Platform
+	starter                     starter
+	config                      *configPayload
+	state                       state
+	cancel                      context.CancelFunc
+	pollCancel                  context.CancelFunc
+	conversationPollTurnID      string
+	conversationStartCommandID  string
+	conversationStartCommandIDs map[string]struct{}
+	session                     session
+	runID                       uint64
+	conversationRunID           uint64
+	conversationPollTimeout     time.Duration
+	interruptTurnID             string
+	workspaceCancel             context.CancelFunc
+	workspaceRunID              uint64
+	workspaceUploadInFlight     bool
+	pendingWatchCancel          context.CancelFunc
+	pendingWatchDone            chan struct{}
+	pendingWatchRunID           uint64
+	pendingResponseCancels      map[string]context.CancelFunc
+	pendingRequestLocal         map[string]pendingLocalState
+	watchChunks                 map[string]watchChunkState
+	notifier                    *stateNotifier
 }
 
 // NewCore constructs a stopped core. Network activity starts only after a
@@ -886,6 +890,7 @@ func (c *Core) refresh(commandID string) string {
 	}
 	c.interruptTurnID = ""
 	c.conversationPollTurnID = ""
+	c.clearConversationStartCommandsLocked()
 	sess := c.session
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	c.cancel = cancel
@@ -1738,6 +1743,7 @@ func (c *Core) selectCodex(commandID, codexID string) string {
 		return c.reject(commandID, errors.New("cannot change conversation while a turn is running"))
 	}
 	c.interruptTurnID = ""
+	c.clearConversationStartCommandsLocked()
 	c.conversationRunID++
 	previousWatchDone := c.cancelPendingLocked()
 	c.pendingWatchRunID++
@@ -1824,6 +1830,7 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 	}
 	c.interruptTurnID = ""
 	c.conversationPollTurnID = ""
+	c.issueConversationStartCommandLocked(commandID)
 	ctx, cancel := context.WithTimeout(context.Background(), c.conversationPollTimeout)
 	c.pollCancel = cancel
 	c.conversationRunID++
@@ -1835,7 +1842,7 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 
 	go func() {
 		callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second)
-		turnID, err := sess.StartTurn(callCtx, codexID, p.Text, p.Options)
+		turnID, err := sess.StartTurn(callCtx, commandID, codexID, p.Text, p.Options)
 		callCancel()
 		if err != nil {
 			c.mu.Lock()
@@ -1870,6 +1877,7 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 			c.pollCancel()
 			c.pollCancel = nil
 			c.conversationPollTurnID = ""
+			c.conversationStartCommandID = ""
 			c.state.Phase = "ready"
 			c.publishLocked()
 			c.mu.Unlock()
@@ -1909,6 +1917,7 @@ func (c *Core) interruptTurn(commandID, turnID string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), c.conversationPollTimeout)
 	c.pollCancel = cancel
 	c.conversationPollTurnID = turnID
+	c.clearConversationStartCommandsLocked()
 	c.conversationRunID++
 	conversationRunID := c.conversationRunID
 	c.interruptTurnID = turnID
@@ -2160,6 +2169,7 @@ func (c *Core) pollConversation(ctx context.Context, sess session, conversationR
 			c.pollCancel()
 			c.pollCancel = nil
 			c.conversationPollTurnID = ""
+			c.conversationStartCommandID = ""
 			if c.interruptTurnID == targetTurnID {
 				c.interruptTurnID = ""
 			}
@@ -2225,6 +2235,7 @@ func (c *Core) finishConversationOperationLocked(conversationRunID uint64, comma
 	c.pollCancel()
 	c.pollCancel = nil
 	c.conversationPollTurnID = ""
+	c.discardConversationStartCommandLocked(commandID)
 	c.interruptTurnID = ""
 	if c.state.Conversation != nil {
 		c.state.Conversation.ActiveTurnID = ""
@@ -2248,6 +2259,7 @@ func (c *Core) stop(commandID string) string {
 		c.pollCancel = nil
 	}
 	c.conversationPollTurnID = ""
+	c.clearConversationStartCommandsLocked()
 	if c.workspaceCancel != nil {
 		c.workspaceCancel()
 		c.workspaceCancel = nil

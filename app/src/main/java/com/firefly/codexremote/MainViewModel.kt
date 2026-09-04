@@ -31,6 +31,7 @@ data class AppUiState(
     val core: CoreState = CoreState(),
     val openCodexId: String? = null,
     val draft: String = "",
+    val optimisticUserMessages: List<OptimisticUserMessage> = emptyList(),
     val stoppingTurn: Boolean = false,
     val lastProjectPath: String = "",
     val projectDialogOpen: Boolean = false,
@@ -72,6 +73,14 @@ data class AppUiState(
     val diagnosticFailed: Boolean = false,
     val foregroundRecoveryInProgress: Boolean = false,
     val foregroundRecoveryError: String = "",
+)
+
+data class OptimisticUserMessage(
+    val commandId: String,
+    val codexId: String,
+    val text: String,
+    val acceptedTurnId: String = "",
+    val createdAtUnixMs: Long = 0,
 )
 
 data class WorkspaceDownloadReady(
@@ -773,8 +782,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun sendMessage() {
         val state = uiState.value
         val text = state.draft.trim()
-        val conversation = state.core.conversation
-        if (text.isEmpty() || conversation?.running == true || conversation?.codexId != state.openCodexId) return
+        if (!canDispatchMessage(state, text)) return
+        val conversation = state.core.conversation ?: return
         val codexId = state.openCodexId ?: return
         val command = coreCommand("start_turn", JSONObject().put("text", text))
         flushPendingDraftWrite()
@@ -783,9 +792,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             codexId = codexId,
             originalDraft = state.draft,
             draftVersion = codexDraftVersions[codexId] ?: 0L,
+            knownTurnIds = conversation.turns.mapTo(mutableSetOf()) { it.turnId },
         )
         codexDrafts.remove(codexId)
-        _uiState.update { it.copy(draft = "", stoppingTurn = false) }
+        _uiState.update { current ->
+            val optimisticMessage = OptimisticUserMessage(
+                commandId = command.getString("id"),
+                codexId = codexId,
+                text = text,
+                createdAtUnixMs = System.currentTimeMillis(),
+            )
+            current.withOptimisticUserMessage(optimisticMessage).copy(
+                draft = "",
+                stoppingTurn = false,
+            )
+        }
         viewModelScope.launch(Dispatchers.IO) {
             dispatchTracked(command, "general")
         }
@@ -964,27 +985,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         codexDrafts.remove(codexId)
         codexDraftVersions.remove(codexId)
         if (persistedSelectedCodexId == codexId) persistedSelectedCodexId = null
+        _uiState.update { current ->
+            val remaining = current.optimisticUserMessages.filterNot { it.codexId == codexId }
+            current.copy(
+                core = projectOptimisticUserMessages(current.core, remaining),
+                optimisticUserMessages = remaining,
+            )
+        }
         if (uiState.value.openCodexId == codexId) closeConversation()
         codexPreferenceWrites.trySend(CodexPreferenceWrite.Forget(codexId))
     }
 
     private fun resolveSentDraft(resolution: SendDraftResolution) {
         val latestVersion = codexDraftVersions[resolution.codexId] ?: 0L
-        if (!shouldApplySendDraftResolution(resolution, latestVersion)) return
+        val persistedDraft = draftPersistenceAfterSendResolution(resolution, latestVersion) ?: return
         if (resolution.accepted) {
             codexDrafts.remove(resolution.codexId)
-            codexPreferenceWrites.trySend(CodexPreferenceWrite.Draft(resolution.codexId, ""))
         } else {
             codexDrafts[resolution.codexId] = resolution.originalDraft
             _uiState.update { current ->
-                if (current.openCodexId == resolution.codexId && current.draft.isEmpty()) {
-                    current.copy(draft = resolution.originalDraft)
-                } else current
+                current.copy(
+                    draft = restoredDraftAfterSendFailure(
+                        currentDraft = current.draft,
+                        openCodexId = current.openCodexId,
+                        resolution = resolution,
+                        latestDraftVersion = latestVersion,
+                    ),
+                )
             }
-            codexPreferenceWrites.trySend(
-                CodexPreferenceWrite.Draft(resolution.codexId, resolution.originalDraft),
-            )
         }
+        codexPreferenceWrites.trySend(CodexPreferenceWrite.Draft(resolution.codexId, persistedDraft))
     }
 
     private fun restorePersistedConversationIfReady() {
@@ -1133,8 +1163,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     completedProject -> projectResolution.codexId
                     else -> current.openCodexId
                 }
+                val optimisticUserMessages = reconcileOptimisticUserMessages(
+                    current.optimisticUserMessages,
+                    decoded,
+                    sentDraftResolution,
+                )
                 var next = current.copy(
-                    core = decoded,
+                    core = projectOptimisticUserMessages(decoded, optimisticUserMessages),
+                    optimisticUserMessages = optimisticUserMessages,
                     userInputDrafts = decodedActiveConversation?.let { conversation ->
                         current.userInputDrafts.filterKeys { requestId ->
                             conversation.pendingRequests.any {
@@ -1362,10 +1398,12 @@ internal class ForgetPersistenceTracker {
 }
 
 internal data class SendDraftResolution(
+    val commandId: String,
     val codexId: String,
     val originalDraft: String,
     val draftVersion: Long,
     val accepted: Boolean,
+    val acceptedTurnId: String = "",
 )
 
 internal class SendDraftTracker {
@@ -1373,27 +1411,85 @@ internal class SendDraftTracker {
         val codexId: String,
         val originalDraft: String,
         val draftVersion: Long,
+        val knownTurnIds: Set<String>,
     )
 
     private val pending = ConcurrentHashMap<String, PendingSend>()
 
-    fun track(commandId: String, codexId: String, originalDraft: String, draftVersion: Long) {
-        pending[commandId] = PendingSend(codexId, originalDraft, draftVersion)
+    fun track(
+        commandId: String,
+        codexId: String,
+        originalDraft: String,
+        draftVersion: Long,
+        knownTurnIds: Set<String> = emptySet(),
+    ) {
+        pending[commandId] = PendingSend(codexId, originalDraft, draftVersion, knownTurnIds)
     }
 
     fun onCoreState(state: CoreState): SendDraftResolution? {
-        val tracked = pending[state.commandId] ?: return null
-        val accepted = state.phase == "ready" && state.error.isBlank() &&
-            state.conversation?.codexId == tracked.codexId && state.conversation.running &&
-            state.conversation.activeTurnId.isNotBlank()
-        val failed = state.phase == "error" || state.error.isNotBlank()
-        if (!accepted && !failed) return null
-        if (!pending.remove(state.commandId, tracked)) return null
+        val current = pending[state.commandId]
+        val conversation = state.conversation
+        val caused = conversation?.turns.orEmpty().mapNotNull { turn ->
+            val commandId = turn.causedByCommandId
+            val tracked = pending[commandId]
+            if (commandId.isNotBlank() && tracked != null && conversation?.codexId == tracked.codexId &&
+                turn.turnId.isNotBlank() && turn.turnId !in tracked.knownTurnIds
+            ) Triple(commandId, tracked, turn.turnId) else null
+        }
+        fun acceptCausal(match: Triple<String, PendingSend, String>): SendDraftResolution? {
+            val (commandId, tracked, turnId) = match
+            if (!pending.remove(commandId, tracked)) return null
+            return SendDraftResolution(
+                commandId = commandId,
+                codexId = tracked.codexId,
+                originalDraft = tracked.originalDraft,
+                draftVersion = tracked.draftVersion,
+                accepted = true,
+                acceptedTurnId = turnId,
+            )
+        }
+        caused.firstOrNull { it.first == state.commandId }?.let { return acceptCausal(it) }
+        if (current != null && definitiveStartTurnRejection(state.error)) {
+            if (!pending.remove(state.commandId, current)) return null
+            return SendDraftResolution(
+                commandId = state.commandId,
+                codexId = current.codexId,
+                originalDraft = current.originalDraft,
+                draftVersion = current.draftVersion,
+                accepted = false,
+            )
+        }
+        caused.firstOrNull()?.let { return acceptCausal(it) }
+
+        if (current != null && (state.error.isNotBlank() || state.phase == "error")) {
+            return null
+        }
+        if (current == null) return null
+
+        val selectedConversation = conversation?.takeIf { it.codexId == current.codexId }
+        val newTurns = selectedConversation?.turns.orEmpty().filter {
+            it.turnId.isNotBlank() && it.turnId !in current.knownTurnIds
+        }
+        val evidencedTurnId = newTurns.firstOrNull { turn ->
+            turn.items.any { it.type == "user_message" } || turn.messages.any { it.role == "user" }
+        }?.turnId
+        val activeTurnId = selectedConversation?.activeTurnId.orEmpty().takeIf {
+            selectedConversation?.running == true && it.isNotBlank() && it !in current.knownTurnIds
+        }
+        val lateResponseTurnId = newTurns.lastOrNull()?.turnId.takeIf {
+            state.phase == "ready" && state.error.isBlank()
+        }
+        val acceptedTurnId = activeTurnId ?: evidencedTurnId ?: lateResponseTurnId.orEmpty()
+        val accepted = acceptedTurnId.isNotBlank()
+        if (!accepted) return null
+        if (!pending.remove(state.commandId, current)) return null
         return SendDraftResolution(
-            codexId = tracked.codexId,
-            originalDraft = tracked.originalDraft,
-            draftVersion = tracked.draftVersion,
-            accepted = accepted,
+            commandId = state.commandId,
+            codexId = current.codexId,
+            originalDraft = current.originalDraft,
+            draftVersion = current.draftVersion,
+            accepted = true,
+            acceptedTurnId = acceptedTurnId,
         )
     }
 
@@ -1401,6 +1497,117 @@ internal class SendDraftTracker {
         pending.entries.removeIf { it.value.codexId == codexId }
     }
 }
+
+private fun definitiveStartTurnRejection(error: String): Boolean {
+    val normalized = error.trim()
+    return normalized in setOf(
+        "a turn is already running",
+        "select_codex is required before start_turn",
+        "start_turn text is required",
+    ) || normalized.startsWith("StartTurn Host error ERROR_CODE_")
+}
+
+internal fun reconcileOptimisticUserMessages(
+    messages: List<OptimisticUserMessage>,
+    core: CoreState,
+    resolution: SendDraftResolution?,
+): List<OptimisticUserMessage> {
+    val resolved = messages.mapNotNull { message ->
+        if (resolution?.commandId != message.commandId) {
+            message
+        } else if (!resolution.accepted) {
+            null
+        } else {
+            message.copy(acceptedTurnId = resolution.acceptedTurnId)
+        }
+    }
+    return resolved.filterNot { message -> coreHasAcceptedUserMessage(core, message) }
+}
+
+internal fun AppUiState.withOptimisticUserMessage(message: OptimisticUserMessage): AppUiState {
+    val optimistic = optimisticUserMessages.filterNot { it.commandId == message.commandId } + message
+    return copy(
+        core = projectOptimisticUserMessages(core, optimistic),
+        optimisticUserMessages = optimistic,
+    )
+}
+
+internal fun canDispatchMessage(state: AppUiState, text: String): Boolean {
+    val codexId = state.openCodexId ?: return false
+    val conversation = state.core.conversation ?: return false
+    return text.isNotBlank() && conversation.codexId == codexId && !conversation.running &&
+        state.optimisticUserMessages.none { it.codexId == codexId && it.acceptedTurnId.isBlank() }
+}
+
+internal fun projectOptimisticUserMessages(
+    core: CoreState,
+    messages: List<OptimisticUserMessage>,
+): CoreState {
+    val conversation = core.conversation ?: return core
+    val cleanedTurns = conversation.turns.mapNotNull { turn ->
+        val items = turn.items.filterNot { it.itemId.startsWith(OptimisticUserItemPrefix) }
+        val legacyMessages = turn.messages.filterNot { it.itemId.startsWith(OptimisticUserItemPrefix) }
+        if (turn.turnId.startsWith(OptimisticTurnPrefix) && items.isEmpty() && legacyMessages.isEmpty()) null
+        else turn.copy(items = items, messages = legacyMessages)
+    }
+    val relevant = messages.filter { it.codexId == conversation.codexId }
+    if (relevant.isEmpty()) return core.copy(conversation = conversation.copy(turns = cleanedTurns))
+
+    val useTypedItems = cleanedTurns.any { it.items.isNotEmpty() }
+    val projectedTurns = cleanedTurns.toMutableList()
+    relevant.forEach { message ->
+        val turnId = message.acceptedTurnId.ifBlank { OptimisticTurnPrefix + message.commandId }
+        val itemId = OptimisticUserItemPrefix + message.commandId
+        val item = ConversationItem(
+            itemId = itemId,
+            turnId = turnId,
+            type = "user_message",
+            status = "started",
+            userMessage = UserMessageItem(listOf(message.text), message.text),
+            provenance = "PROVENANCE_KIND_LIVE_WIRE",
+        )
+        val legacyMessage = ConversationMessage(itemId, "user", message.text, "started")
+        val existingTurnIndex = projectedTurns.indexOfFirst { it.turnId == turnId }
+        if (existingTurnIndex >= 0) {
+            val turn = projectedTurns[existingTurnIndex]
+            projectedTurns[existingTurnIndex] = if (useTypedItems) {
+                turn.copy(items = turn.items + item)
+            } else {
+                turn.copy(messages = turn.messages + legacyMessage)
+            }
+        } else {
+            projectedTurns += ConversationTurn(
+                turnId = turnId,
+                status = "running",
+                failure = "",
+                startedAtUnixMs = message.createdAtUnixMs,
+                completedAtUnixMs = 0,
+                items = if (useTypedItems) listOf(item) else emptyList(),
+                messages = if (useTypedItems) emptyList() else listOf(legacyMessage),
+                provenance = "PROVENANCE_KIND_LIVE_WIRE",
+            )
+        }
+    }
+    val hasUnresolvedSend = relevant.any { it.acceptedTurnId.isBlank() }
+    val displayPhase = if (hasUnresolvedSend && core.phase == "ready" && !conversation.running) {
+        "starting_turn"
+    } else core.phase
+    return core.copy(
+        phase = displayPhase,
+        conversation = conversation.copy(turns = projectedTurns),
+    )
+}
+
+private fun coreHasAcceptedUserMessage(core: CoreState, message: OptimisticUserMessage): Boolean {
+    if (message.acceptedTurnId.isBlank()) return false
+    val conversation = core.conversation?.takeIf { it.codexId == message.codexId } ?: return false
+    val turn = conversation.turns.firstOrNull { it.turnId == message.acceptedTurnId } ?: return false
+    return turn.items.any { it.type == "user_message" && !it.itemId.startsWith(OptimisticUserItemPrefix) } ||
+        turn.messages.any { it.role == "user" && !it.itemId.startsWith(OptimisticUserItemPrefix) }
+}
+
+private const val OptimisticTurnPrefix = "optimistic-turn-"
+private const val OptimisticUserItemPrefix = "optimistic-user-"
 
 internal fun draftForCodex(drafts: Map<String, String>, codexId: String?): String =
     codexId?.let(drafts::get).orEmpty()
@@ -1432,6 +1639,23 @@ internal fun authoritativeForgottenCodex(
 
 internal fun shouldApplySendDraftResolution(resolution: SendDraftResolution, latestDraftVersion: Long): Boolean =
     resolution.draftVersion == latestDraftVersion
+
+internal fun draftPersistenceAfterSendResolution(
+    resolution: SendDraftResolution,
+    latestDraftVersion: Long,
+): String? = if (shouldApplySendDraftResolution(resolution, latestDraftVersion)) {
+    if (resolution.accepted) "" else resolution.originalDraft
+} else null
+
+internal fun restoredDraftAfterSendFailure(
+    currentDraft: String,
+    openCodexId: String?,
+    resolution: SendDraftResolution,
+    latestDraftVersion: Long,
+): String = if (
+    !resolution.accepted && openCodexId == resolution.codexId && currentDraft.isEmpty() &&
+    shouldApplySendDraftResolution(resolution, latestDraftVersion)
+) resolution.originalDraft else currentDraft
 
 internal fun effectiveClientVersion(installedVersionName: String?): String =
     installedVersionName?.trim().orEmpty().ifBlank { "unknown" }

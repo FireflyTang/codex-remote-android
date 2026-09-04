@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,7 +44,7 @@ type delayedStartErrorSession struct {
 	pollCalled chan struct{}
 }
 
-func (s *delayedStartErrorSession) StartTurn(ctx context.Context, _, _ string, _ *turnOptionsPayload) (string, error) {
+func (s *delayedStartErrorSession) StartTurn(ctx context.Context, _, _, _ string, _ *turnOptionsPayload) (string, error) {
 	close(s.started)
 	select {
 	case <-ctx.Done():
@@ -62,7 +63,7 @@ func (s *delayedStartErrorSession) ListHistory(ctx context.Context, _ string) (c
 	return conversationState{}, ctx.Err()
 }
 
-func (s *delayedStartSession) StartTurn(ctx context.Context, _, _ string, _ *turnOptionsPayload) (string, error) {
+func (s *delayedStartSession) StartTurn(ctx context.Context, _, _, _ string, _ *turnOptionsPayload) (string, error) {
 	close(s.started)
 	select {
 	case <-ctx.Done():
@@ -172,6 +173,276 @@ func TestWatchEventsBuildLiveTurnAndMergeHistoryWithoutDuplicates(t *testing.T) 
 	merged := mergeConversationSnapshot(*c.state.Conversation, history)
 	if len(merged.Turns) != 2 || merged.Running || merged.ActiveTurnID != "" || merged.Turns[1].Status != "completed" || len(merged.Turns[1].Items) != 1 || merged.Turns[1].Items[0].AgentMessage.Text != "hello" {
 		t.Fatalf("merged conversation=%+v", merged)
+	}
+}
+
+func TestMergeConversationSnapshotPrefersCompleteLiveTurnWhenHistoryItemIDsDrift(t *testing.T) {
+	liveUser := conversationItem{ItemID: "01a06b05-dd5d-7751-8ddc-032272c3c92e", TurnID: "01a06b05-d9b3-7ca2-a7e3-ad77a7d370d9", Type: "user_message", Status: "completed", Provenance: "PROVENANCE_KIND_LIVE_WIRE", UserMessage: &conversationUserMessage{TextParts: []string{"again"}, Text: "again"}}
+	liveAgent := conversationItem{ItemID: "msg_0aeac14c76c8a7ac", TurnID: liveUser.TurnID, Type: "agent_message", Status: "completed", Provenance: "PROVENANCE_KIND_LIVE_WIRE", AgentMessage: &conversationAgentMessage{Text: "answer"}}
+	historyUser := conversationItem{ItemID: "item-17", TurnID: liveUser.TurnID, Type: "user_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", UserMessage: &conversationUserMessage{TextParts: []string{"again"}, Text: "again"}}
+	historyAgent := conversationItem{ItemID: "item-18", TurnID: liveUser.TurnID, Type: "agent_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", AgentMessage: &conversationAgentMessage{Text: "answer"}}
+	live := conversationState{CodexID: "C1", Turns: []conversationTurn{{TurnID: liveUser.TurnID, Status: "completed", Items: []conversationItem{liveUser, liveAgent}, LiveFromStart: true}}}
+	history := conversationState{CodexID: "C1", HistoryComplete: true, Turns: []conversationTurn{{TurnID: liveUser.TurnID, Status: "completed", Items: []conversationItem{historyUser, historyAgent}}}}
+
+	merged := mergeConversationSnapshot(live, history)
+	if len(merged.Turns) != 1 || len(merged.Turns[0].Items) != 2 || len(merged.Turns[0].Messages) != 2 {
+		t.Fatalf("same stable turn was rendered from both live and history: %+v", merged.Turns)
+	}
+	if merged.Turns[0].Items[0].ItemID != liveUser.ItemID || merged.Turns[0].Items[1].ItemID != liveAgent.ItemID {
+		t.Fatalf("live identities were replaced: %+v", merged.Turns[0].Items)
+	}
+}
+
+func TestMergeConversationSnapshotIncompleteLiveTurnStillAcceptsHistoryItems(t *testing.T) {
+	live := conversationState{CodexID: "C1", Turns: []conversationTurn{{
+		TurnID: "TURN-1", Status: "running", LiveFromStart: true,
+		Completeness: &conversationCompleteness{Incomplete: true},
+		Items:        []conversationItem{{ItemID: "LIVE-USER", TurnID: "TURN-1", Type: "user_message", Status: "completed", Provenance: "PROVENANCE_KIND_LIVE_WIRE", UserMessage: &conversationUserMessage{Text: "question"}}},
+	}}}
+	history := conversationState{CodexID: "C1", Turns: []conversationTurn{{
+		TurnID: "TURN-1", Status: "completed",
+		Items: []conversationItem{{ItemID: "HISTORY-AGENT", TurnID: "TURN-1", Type: "agent_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", AgentMessage: &conversationAgentMessage{Text: "answer"}}},
+	}}}
+
+	merged := mergeConversationSnapshot(live, history)
+	if len(merged.Turns) != 1 || len(merged.Turns[0].Items) != 2 {
+		t.Fatalf("incomplete live turn did not accept history supplement: %+v", merged.Turns)
+	}
+}
+
+func TestRunningPollCannotPoisonCompleteLiveTurnIdentityLineage(t *testing.T) {
+	const turnID = "01a06b05-d9b3-7ca2-a7e3-ad77a7d370d9"
+	liveUser := conversationItem{ItemID: "01a06b05-dd5d-7751-8ddc-032272c3c92e", TurnID: turnID, Type: "user_message", Status: "completed", Provenance: "PROVENANCE_KIND_LIVE_WIRE", UserMessage: &conversationUserMessage{Text: "again"}}
+	liveAgent := conversationItem{ItemID: "msg_0aeac14c76c8a7ac", TurnID: turnID, Type: "agent_message", Status: "running", Provenance: "PROVENANCE_KIND_LIVE_WIRE", AgentMessage: &conversationAgentMessage{Text: "ans"}}
+	history := conversationState{CodexID: "C1", Turns: []conversationTurn{{
+		TurnID: turnID, Status: "running",
+		Items: []conversationItem{
+			{ItemID: "item-17", TurnID: turnID, Type: "user_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", UserMessage: &conversationUserMessage{Text: "again"}},
+			{ItemID: "item-18", TurnID: turnID, Type: "agent_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", AgentMessage: &conversationAgentMessage{Text: "answer"}},
+		},
+	}}}
+	c := NewCore(new(fakePlatform))
+	c.state.Conversation = &conversationState{CodexID: "C1", ActiveTurnID: turnID, Running: true, Turns: []conversationTurn{{
+		TurnID: turnID, Status: "running", LiveFromStart: true, Items: []conversationItem{liveUser, liveAgent},
+	}}}
+
+	merged := mergeConversationSnapshot(*c.state.Conversation, history)
+	if len(merged.Turns) != 1 || len(merged.Turns[0].Items) != 2 {
+		t.Fatalf("running poll injected imported identity aliases: %+v", merged.Turns)
+	}
+	c.state.Conversation = &merged
+	for _, raw := range []*remotev1.Event{
+		{CodexId: "C1", EventSeq: 2, Event: &remotev1.Event_ItemCompleted{ItemCompleted: &remotev1.ItemCompleted{Item: &remotev1.Item{ItemId: liveAgent.ItemID, TurnId: turnID, Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED, Provenance: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, Content: &remotev1.Item_AgentMessage{AgentMessage: &remotev1.AgentMessageItem{Text: "answer"}}}}}},
+		{CodexId: "C1", EventSeq: 3, Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{TurnId: turnID, Status: remotev1.TurnStatus_TURN_STATUS_COMPLETED}}},
+	} {
+		event, err := pendingWatchEventFromProto(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.applyWatchEventLocked(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history.Turns[0].Status = "completed"
+	final := mergeConversationSnapshot(*c.state.Conversation, history)
+	if len(final.Turns) != 1 || len(final.Turns[0].Items) != 2 || len(final.Turns[0].Messages) != 2 {
+		t.Fatalf("terminal history handoff duplicated the live turn: %+v", final.Turns)
+	}
+	if final.Turns[0].Items[0].ItemID != liveUser.ItemID || final.Turns[0].Items[1].ItemID != liveAgent.ItemID {
+		t.Fatalf("terminal history handoff replaced live identities: %+v", final.Turns[0].Items)
+	}
+}
+
+func TestCausalRunningReplacesEarlierPollProjectionBeforeLiveHandoff(t *testing.T) {
+	const (
+		turnID    = "01a06b05-d9b3-7ca2-a7e3-ad77a7d370d9"
+		commandID = "start-command"
+	)
+	history := conversationState{CodexID: "C1", Turns: []conversationTurn{{
+		TurnID: turnID, Status: "running", StartedAtUnixMS: 10,
+		Items: []conversationItem{
+			{ItemID: "item-17", TurnID: turnID, Type: "user_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", UserMessage: &conversationUserMessage{Text: "again"}},
+			{ItemID: "item-18", TurnID: turnID, Type: "agent_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", AgentMessage: &conversationAgentMessage{Text: "answer"}},
+		},
+	}}}
+	c := NewCore(new(fakePlatform))
+	c.state.Conversation = &history
+	c.issueConversationStartCommandLocked(commandID)
+	events := []*remotev1.Event{
+		{CodexId: "C1", EventSeq: 1, CausedByRequestId: commandID, Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{TurnId: turnID, Status: remotev1.TurnStatus_TURN_STATUS_RUNNING, StartedAtUnixMs: 10}}},
+		{CodexId: "C1", EventSeq: 2, Event: &remotev1.Event_ItemCompleted{ItemCompleted: &remotev1.ItemCompleted{Item: &remotev1.Item{ItemId: "live-user", TurnId: turnID, Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED, Provenance: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Input: []*remotev1.UserInputPart{{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "again"}}}}}}}}}},
+		{CodexId: "C1", EventSeq: 3, Event: &remotev1.Event_ItemCompleted{ItemCompleted: &remotev1.ItemCompleted{Item: &remotev1.Item{ItemId: "live-agent", TurnId: turnID, Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED, Provenance: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, Content: &remotev1.Item_AgentMessage{AgentMessage: &remotev1.AgentMessageItem{Text: "answer"}}}}}},
+		{CodexId: "C1", EventSeq: 4, Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{TurnId: turnID, Status: remotev1.TurnStatus_TURN_STATUS_COMPLETED, CompletedAtUnixMs: 20}}},
+	}
+	for index, raw := range events {
+		event, err := pendingWatchEventFromProto(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.applyWatchEventLocked(event); err != nil {
+			t.Fatal(err)
+		}
+		if index == 0 && (len(c.state.Conversation.Turns[0].Items) != 0 || c.state.Conversation.Turns[0].CausedByCommandID != commandID || !c.state.Conversation.Turns[0].LiveFromStart) {
+			t.Fatalf("causal running did not isolate the live lineage: %+v", c.state.Conversation.Turns[0])
+		}
+	}
+	history.Turns[0].Status = "completed"
+	history.Turns[0].CompletedAtUnixMS = 20
+	final := mergeConversationSnapshot(*c.state.Conversation, history)
+	if len(final.Turns) != 1 || len(final.Turns[0].Items) != 2 || len(final.Turns[0].Messages) != 2 {
+		t.Fatalf("response/poll/causal handoff duplicated the live turn: %+v", final.Turns)
+	}
+	if final.Turns[0].Items[0].ItemID != "live-user" || final.Turns[0].Items[1].ItemID != "live-agent" || final.Turns[0].CausedByCommandID != commandID {
+		t.Fatalf("live identity or request cause was lost: %+v", final.Turns[0])
+	}
+	encoded, err := json.Marshal(final.Turns[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"causedByCommandId":"start-command"`) {
+		t.Fatalf("serialized turn omitted causal request: %s", encoded)
+	}
+}
+
+func TestMidTurnResetDoesNotClaimCompleteLiveProjection(t *testing.T) {
+	c := NewCore(new(fakePlatform))
+	c.state.Conversation = &conversationState{CodexID: "C1", Turns: []conversationTurn{}}
+	c.issueConversationStartCommandLocked("start-command")
+	started, err := pendingWatchEventFromProto(&remotev1.Event{
+		CodexId: "C1", EventSeq: 1, CausedByRequestId: "start-command",
+		Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{TurnId: "TURN-1", Status: remotev1.TurnStatus_TURN_STATUS_RUNNING}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.applyWatchEventLocked(started); err != nil {
+		t.Fatal(err)
+	}
+	if !c.state.Conversation.Turns[0].LiveFromStart {
+		t.Fatal("caused running event did not establish a continuous live projection")
+	}
+	resetItem := conversationItem{ItemID: "LIVE-USER", TurnID: "TURN-1", Type: "user_message", Status: "completed", Provenance: "PROVENANCE_KIND_LIVE_WIRE", UserMessage: &conversationUserMessage{Text: "question"}}
+	c.applyWatchResetLocked(pendingWatchReset{ActiveTurn: &conversationTurn{TurnID: "TURN-1", Status: "running", Items: []conversationItem{resetItem}}})
+	turn := &c.state.Conversation.Turns[0]
+	if turn.LiveFromStart {
+		t.Fatal("mid-turn RESET was incorrectly treated as a complete live stream")
+	}
+	if turn.CausedByCommandID != "start-command" {
+		t.Fatalf("RESET cleared causal request ID: %+v", turn)
+	}
+	turn.Status = "completed"
+	history := conversationState{CodexID: "C1", Turns: []conversationTurn{{
+		TurnID: "TURN-1", Status: "completed",
+		Items: []conversationItem{{ItemID: "HISTORY-AGENT", TurnID: "TURN-1", Type: "agent_message", Status: "completed", Provenance: "PROVENANCE_KIND_IMPORTED_HISTORY", AgentMessage: &conversationAgentMessage{Text: "answer"}}},
+	}}}
+
+	merged := mergeConversationSnapshot(*c.state.Conversation, history)
+	if len(merged.Turns) != 1 || len(merged.Turns[0].Items) != 2 {
+		t.Fatalf("mid-turn RESET did not accept history supplement: %+v", merged.Turns)
+	}
+}
+
+func TestCausalRunningAfterTerminalIncompletePollRestartsIssuedLiveLineage(t *testing.T) {
+	const (
+		commandID = "start-command"
+		turnID    = "T1"
+	)
+	sess := &delayedStartSession{started: make(chan struct{}), release: make(chan struct{})}
+	c := NewCore(new(fakePlatform))
+	c.session, c.state.Phase, c.state.SelectedCodexID = sess, "ready", "C1"
+	c.state.Conversation = &conversationState{CodexID: "C1", Turns: []conversationTurn{}}
+	c.startTurn(commandID, startTurnPayload{Text: "question"})
+	select {
+	case <-sess.started:
+	case <-time.After(time.Second):
+		t.Fatal("StartTurn RPC did not start")
+	}
+	// Model a terminal, incomplete ListHistory projection arriving before the
+	// successful StartTurn response and causal watch event.
+	c.mu.Lock()
+	c.state.Conversation = &conversationState{CodexID: "C1", Turns: []conversationTurn{{
+		TurnID: turnID, Status: "completed", CompletedAtUnixMS: 20,
+		Failure:      "stale failure",
+		Provenance:   remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY.String(),
+		Completeness: &conversationCompleteness{Incomplete: true, Reason: "history lag"},
+		Items: []conversationItem{{
+			ItemID: "item-17", TurnID: turnID, Type: "user_message", Status: "completed",
+			Provenance:  remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY.String(),
+			UserMessage: &conversationUserMessage{Text: "question"},
+		}},
+	}}}
+	c.mu.Unlock()
+	close(sess.release)
+	waitState(t, c, func(state state) bool { return state.Phase == "ready" })
+	c.mu.Lock()
+	if c.conversationStartCommandID != "" {
+		c.mu.Unlock()
+		t.Fatalf("terminal response path retained current StartTurn command %q", c.conversationStartCommandID)
+	}
+	if _, ok := c.conversationStartCommandIDs[commandID]; !ok {
+		c.mu.Unlock()
+		t.Fatal("terminal response path forgot issued StartTurn before causal event")
+	}
+	event, err := pendingWatchEventFromProto(&remotev1.Event{
+		CodexId: "C1", EventSeq: 1, CausedByRequestId: commandID,
+		Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{
+			TurnId: turnID, Status: remotev1.TurnStatus_TURN_STATUS_RUNNING, StartedAtUnixMs: 10,
+		}},
+	})
+	if err != nil {
+		c.mu.Unlock()
+		t.Fatal(err)
+	}
+	if err := c.applyWatchEventLocked(event); err != nil {
+		c.mu.Unlock()
+		t.Fatal(err)
+	}
+	turn := c.state.Conversation.Turns[0]
+	c.mu.Unlock()
+	if turn.Status != "running" || turn.CompletedAtUnixMS != 0 || turn.Failure != "" || turn.Completeness != nil || len(turn.Items) != 0 {
+		t.Fatalf("causal running retained terminal poll projection: %+v", turn)
+	}
+	if turn.CausedByCommandID != commandID || !continuousLiveTurnProjection(turn) {
+		t.Fatalf("causal running did not establish continuous live lineage: %+v", turn)
+	}
+}
+
+func TestUnissuedCausalRunningCannotClaimContinuousLiveProjection(t *testing.T) {
+	c := NewCore(new(fakePlatform))
+	c.state.Conversation = &conversationState{CodexID: "C1", Turns: []conversationTurn{{
+		TurnID: "TURN-1", Status: "completed", CompletedAtUnixMS: 20,
+		Completeness: &conversationCompleteness{Incomplete: true},
+	}}}
+	event, err := pendingWatchEventFromProto(&remotev1.Event{
+		CodexId: "C1", EventSeq: 1, CausedByRequestId: "foreign-command",
+		Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{
+			TurnId: "TURN-1", Status: remotev1.TurnStatus_TURN_STATUS_RUNNING,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.applyWatchEventLocked(event); err != nil {
+		t.Fatal(err)
+	}
+	turn := c.state.Conversation.Turns[0]
+	if turn.LiveFromStart || turn.CausedByCommandID != "" || turn.Status != "completed" {
+		t.Fatalf("unissued causal request was trusted: %+v", turn)
+	}
+}
+
+func TestMergeConversationSnapshotPreservesRepeatedTextWithDistinctIdentities(t *testing.T) {
+	question := func(turnID, itemID string) conversationTurn {
+		return conversationTurn{TurnID: turnID, Status: "completed", Items: []conversationItem{{
+			ItemID: itemID, TurnID: turnID, Type: "user_message", Status: "completed",
+			UserMessage: &conversationUserMessage{TextParts: []string{"same question"}, Text: "same question"},
+		}}}
+	}
+	history := conversationState{CodexID: "C1", Turns: []conversationTurn{question("TURN-1", "USER-1"), question("TURN-2", "USER-2")}}
+
+	merged := mergeConversationSnapshot(conversationState{CodexID: "C1"}, history)
+	if len(merged.Turns) != 2 || len(merged.Turns[0].Items) != 1 || len(merged.Turns[1].Items) != 1 {
+		t.Fatalf("distinct repeated messages were incorrectly deduplicated: %+v", merged.Turns)
 	}
 }
 

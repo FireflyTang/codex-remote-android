@@ -358,8 +358,8 @@ func (s *liveSession) ListHistory(ctx context.Context, codexID string) (conversa
 	return s.currentClient().ListHistory(ctx, codexID)
 }
 
-func (s *liveSession) StartTurn(ctx context.Context, codexID, text string, options *turnOptionsPayload) (string, error) {
-	return s.currentClient().StartTurn(ctx, codexID, text, options)
+func (s *liveSession) StartTurn(ctx context.Context, commandID, codexID, text string, options *turnOptionsPayload) (string, error) {
+	return s.currentClient().StartTurn(ctx, commandID, codexID, text, options)
 }
 
 func (s *liveSession) InterruptTurn(ctx context.Context, codexID, turnID string) (string, error) {

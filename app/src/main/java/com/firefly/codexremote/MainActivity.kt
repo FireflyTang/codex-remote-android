@@ -1826,28 +1826,73 @@ internal fun TimelineItem(item: ConversationItem, timestamp: String = "", connec
 
 @Composable
 private fun MessageBubble(label: String, text: String, user: Boolean, item: ConversationItem, timestamp: String, connectBelow: Boolean) {
-    TimelineRow(
-        connectBelow = connectBelow,
-        leading = {
-            TimelineAvatar(if (user) "你" else "C", if (user) CodexColors.IndigoSoft else Color(0xFF392A6E), if (user) Color(0xFFBBC3FF) else Color(0xFFD6C7FF))
-        },
+    val avatarBackground = if (user) CodexColors.IndigoSoft else Color(0xFF392A6E)
+    val avatarForeground = if (user) Color(0xFFBBC3FF) else Color(0xFFD6C7FF)
+    val bubbleColor = if (user) CodexColors.IndigoSoft.copy(alpha = 0.72f) else CodexColors.Raised
+    val bubbleShape = if (user) {
+        RoundedCornerShape(topStart = 18.dp, topEnd = 5.dp, bottomStart = 18.dp, bottomEnd = 18.dp)
+    } else {
+        RoundedCornerShape(topStart = 5.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 18.dp)
+    }
+    val connectorColor = CodexColors.Border
+    BoxWithConstraints(
+        Modifier
+            .fillMaxWidth()
+            .clipToBounds()
+            .drawBehind {
+                if (connectBelow) {
+                    val x = if (user) size.width - 18.dp.toPx() else 18.dp.toPx()
+                    drawLine(connectorColor, Offset(x, 18.dp.toPx()), Offset(x, size.height), 1.dp.toPx())
+                }
+            }
+            .testTag(if (user) "message-row-user" else "message-row-assistant"),
     ) {
-        Column(Modifier.fillMaxWidth().padding(top = 2.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(label, style = MaterialTheme.typography.titleMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (item.status == "running") Text("生成中…", style = MaterialTheme.typography.labelSmall, color = CodexColors.Cyan)
-                    if (item.status == "failed") Text("失败", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
-                    if (timestamp.isNotBlank()) Text(timestamp, style = MaterialTheme.typography.labelSmall, color = CodexColors.TextMuted)
+        val bubbleMaxWidth = maxWidth * 0.78f
+        Row(
+            Modifier.fillMaxWidth().padding(bottom = 18.dp),
+            horizontalArrangement = if (user) Arrangement.End else Arrangement.Start,
+            verticalAlignment = Alignment.Top,
+        ) {
+            if (!user) {
+                TimelineAvatar("C", avatarBackground, avatarForeground, Modifier.testTag("message-avatar-assistant"))
+                Spacer(Modifier.width(10.dp))
+            }
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = bubbleMaxWidth)
+                    .testTag(if (user) "message-bubble-user" else "message-bubble-assistant"),
+                shape = bubbleShape,
+                color = bubbleColor,
+                border = BorderStroke(1.dp, CodexColors.Border),
+            ) {
+                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (user) MessageStatusAndTime(item, timestamp)
+                        Text(label, style = MaterialTheme.typography.titleMedium)
+                        if (!user) MessageStatusAndTime(item, timestamp)
+                    }
+                    if (user) {
+                        Text(text.ifBlank { "（空消息）" }, style = MaterialTheme.typography.bodyLarge, color = CodexColors.Text)
+                    } else {
+                        MarkdownBody(text, "（空消息）", MaterialTheme.typography.bodyLarge)
+                    }
+                    CompletenessNotice(item.completeness)
                 }
             }
             if (user) {
-                Text(text.ifBlank { "（空消息）" }, style = MaterialTheme.typography.bodyLarge, color = CodexColors.Text)
-            } else {
-                MarkdownBody(text, "（空消息）", MaterialTheme.typography.bodyLarge)
+                Spacer(Modifier.width(10.dp))
+                TimelineAvatar("你", avatarBackground, avatarForeground, Modifier.testTag("message-avatar-user"))
             }
-            CompletenessNotice(item.completeness)
         }
+    }
+}
+
+@Composable
+private fun MessageStatusAndTime(item: ConversationItem, timestamp: String) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (item.status == "running") Text("生成中…", style = MaterialTheme.typography.labelSmall, color = CodexColors.Cyan)
+        if (item.status == "failed") Text("失败", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+        if (timestamp.isNotBlank()) Text(timestamp, style = MaterialTheme.typography.labelSmall, color = CodexColors.TextMuted)
     }
 }
 
@@ -1876,8 +1921,8 @@ private fun TimelineRow(
 }
 
 @Composable
-private fun TimelineAvatar(text: String, background: Color, foreground: Color) {
-    Surface(Modifier.size(36.dp), CircleShape, color = background) {
+private fun TimelineAvatar(text: String, background: Color, foreground: Color, modifier: Modifier = Modifier) {
+    Surface(modifier.size(36.dp), CircleShape, color = background) {
         Text(text, Modifier.wrapContentSize(Alignment.Center), color = foreground, style = MaterialTheme.typography.titleMedium)
     }
 }

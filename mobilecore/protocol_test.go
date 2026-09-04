@@ -554,6 +554,7 @@ func pendingProtoUserInputMany(id string, resolved bool, count int) *remotev1.Pe
 }
 
 func TestProtocolConversationHistoryPaginationStartAndInterrupt(t *testing.T) {
+	const startTurnCommandID = "COMMAND-START-TURN"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{WebSocketSubprotocol}})
 		if err != nil {
@@ -592,8 +593,8 @@ func TestProtocolConversationHistoryPaginationStartAndInterrupt(t *testing.T) {
 
 		start := readTestFrame(t, ctx, conn).GetRequest()
 		startRequest := start.GetStartTurn()
-		if startRequest.GetCodexId() != "CODEX-1" || startRequest.GetInput()[0].GetText().GetText() != "next" || startRequest.GetOptions().GetMode() != "plan" {
-			t.Errorf("StartTurn=%+v", startRequest)
+		if start.GetRequestId() != startTurnCommandID || startRequest.GetCodexId() != "CODEX-1" || startRequest.GetInput()[0].GetText().GetText() != "next" || startRequest.GetOptions().GetMode() != "plan" {
+			t.Errorf("StartTurn request ID=%q payload=%+v", start.GetRequestId(), startRequest)
 			return
 		}
 		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: start.RequestId, Result: &remotev1.Response_StartTurn{StartTurn: &remotev1.StartTurnResponse{TurnId: "TURN-2"}}}}})
@@ -625,7 +626,7 @@ func TestProtocolConversationHistoryPaginationStartAndInterrupt(t *testing.T) {
 	if !history.HistoryComplete || history.ActiveTurnID != "TURN-1" || !history.Running || len(history.Turns) != 2 || len(history.Turns[1].Messages) != 1 || history.Turns[1].Messages[0].Role != "assistant" {
 		t.Fatalf("history=%+v", history)
 	}
-	turnID, err := client.StartTurn(ctx, "CODEX-1", "next", &turnOptionsPayload{Mode: "plan"})
+	turnID, err := client.StartTurn(ctx, startTurnCommandID, "CODEX-1", "next", &turnOptionsPayload{Mode: "plan"})
 	if err != nil || turnID != "TURN-2" {
 		t.Fatalf("StartTurn=(%q, %v)", turnID, err)
 	}

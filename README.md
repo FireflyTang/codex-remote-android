@@ -28,9 +28,12 @@
 
 ## 验证范围
 
-当前 v0.3.0 候选版本的 MobileCore Go 全量与 `-race` 测试均通过；普通
-`go test -json -count=1 ./...` 运行共有 132 个通过的 Test/subtest 事件；JVM 129/129、
-API 36 x86_64 低资源模拟器 connected suite 51/51。connected 稳定配置为 1536 MiB、
+v0.3.1 是会话稳定性补丁：发送后会立即显示用户消息，并在 StartTurn response、Host watch
+事件和历史校准乱序时保持一致；发送被明确拒绝时仍会恢复未发送草稿。
+
+当前 v0.3.1 候选版本的 MobileCore Go 全量与 `-race` 测试均通过；普通
+`go test -json -count=1 ./...` 运行共有 140 个通过的 Test/subtest 事件；JVM 142/142、
+API 36 x86_64 低资源模拟器 connected suite 53/53。connected 稳定配置为 1536 MiB、
 2 核、720x1600@320、SwiftShader GLES 并明确禁用 Vulkan；emulator 实际 guest
 `MemTotal` 约 2532296 kB。
 现有自动化覆盖连接与错误状态、项目目录和 session 可用性、会话管理、rich timeline、
@@ -54,9 +57,9 @@ APK 中 arm64 native ELF 的 `LOAD` segment 对齐为 `0x4000`，且该 native �
 
 ## 下载 APK
 
-当前个人 Demo 可从 [GitHub Release v0.3.0](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.3.0)
-下载 `codex-remote-android-v0.3.0-debug.apk`，或使用
-[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.3.0/codex-remote-android-v0.3.0-debug.apk)。
+当前个人 Demo 可从 [GitHub Release v0.3.1](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.3.1)
+下载 `codex-remote-android-v0.3.1-debug.apk`，或使用
+[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.3.1/codex-remote-android-v0.3.1-debug.apk)。
 这是便于试用的 debug APK，并非商店签名的正式发行包。
 
 ## 构建

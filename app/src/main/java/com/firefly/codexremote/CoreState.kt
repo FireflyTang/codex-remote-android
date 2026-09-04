@@ -180,6 +180,7 @@ data class ConversationTurn(
     val messages: List<ConversationMessage>,
     val completeness: ItemCompleteness? = null,
     val provenance: String = "",
+    val causedByCommandId: String = "",
 )
 
 data class PendingError(
@@ -357,6 +358,7 @@ fun decodeCoreState(raw: String): CoreState {
                             completedAtUnixMs = turn.optLong("completedAtUnixMs"),
                             completeness = decodeCompleteness(turn.optJSONObject("completeness")),
                             provenance = turn.optString("provenance"),
+                            causedByCommandId = turn.optString("causedByCommandId"),
                             items = buildList {
                                 if (items != null) repeat(items.length()) { itemIndex ->
                                     val item = items.optJSONObject(itemIndex) ?: return@repeat
