@@ -306,7 +306,6 @@ fun CodexRemoteScreen(
         color = CodexColors.Graphite,
     ) {
         if (displayState.openCodexId != null) {
-            BackHandler(onBack = if (displayState.conversationPage == ConversationPage.WORKSPACE) onShowConversation else onCloseConversation)
             ConversationScreen(
                 displayState.core.codexes.find { it.id == displayState.openCodexId }?.title.orEmpty().ifBlank { "Codex 会话" },
                 displayState, onDraftChanged, onSend, onStop, onCloseConversation,
@@ -816,19 +815,40 @@ private fun ConversationScreen(
     onExportDiagnostics: () -> Unit,
 ) {
     var drag by remember { mutableFloatStateOf(0f) }
+    var selectedPage by rememberSaveable(state.openCodexId) {
+        mutableStateOf(state.conversationPage.toConversationSurfacePage())
+    }
+    LaunchedEffect(state.conversationPage) {
+        if (selectedPage != ConversationSurfacePage.CONTEXT) {
+            selectedPage = state.conversationPage.toConversationSurfacePage()
+        }
+    }
+    fun showConversation() {
+        selectedPage = ConversationSurfacePage.CONVERSATION
+        onShowConversation()
+    }
+    fun showWorkspace() {
+        selectedPage = ConversationSurfacePage.WORKSPACE
+        onShowWorkspace()
+    }
+    BackHandler {
+        if (selectedPage == ConversationSurfacePage.CONVERSATION) onBack() else showConversation()
+    }
     val core = state.core
     val conversation = activeConversation(state)
     Column(
         Modifier.fillMaxSize().imePadding().testTag("conversation-root")
-            .pointerInput(state.conversationPage, onBack) {
+            .pointerInput(selectedPage, onBack) {
                 detectHorizontalDragGestures(
                     onDragStart = { drag = 0f },
                     onHorizontalDrag = { _, amount -> drag += amount },
                     onDragEnd = {
                         when {
-                            state.conversationPage == ConversationPage.CONVERSATION && drag < -180f -> onShowWorkspace()
-                            state.conversationPage == ConversationPage.CONVERSATION && drag > 180f -> onBack()
-                            state.conversationPage == ConversationPage.WORKSPACE && drag > 180f -> onShowConversation()
+                            selectedPage == ConversationSurfacePage.CONVERSATION && drag < -180f -> showWorkspace()
+                            selectedPage == ConversationSurfacePage.CONVERSATION && drag > 180f -> onBack()
+                            selectedPage == ConversationSurfacePage.WORKSPACE && drag < -180f -> selectedPage = ConversationSurfacePage.CONTEXT
+                            selectedPage == ConversationSurfacePage.WORKSPACE && drag > 180f -> showConversation()
+                            selectedPage == ConversationSurfacePage.CONTEXT && drag > 180f -> showWorkspace()
                         }
                         drag = 0f
                     },
@@ -841,14 +861,15 @@ private fun ConversationScreen(
                 .padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (state.conversationPage == ConversationPage.CONVERSATION) {
+            if (selectedPage == ConversationSurfacePage.CONVERSATION) {
                 IconButton(
                     onBack, Modifier.testTag("conversation-back").semantics { contentDescription = "返回会话列表" },
                 ) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回会话列表") }
             } else {
                 IconButton(
-                    onShowConversation,
-                    Modifier.testTag("workspace-back").semantics { contentDescription = "返回会话" },
+                    ::showConversation,
+                    Modifier.testTag(if (selectedPage == ConversationSurfacePage.WORKSPACE) "workspace-back" else "context-back")
+                        .semantics { contentDescription = "返回会话" },
                 ) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回会话") }
             }
             Column(Modifier.weight(1f)) {
@@ -884,8 +905,11 @@ private fun ConversationScreen(
             )
         }
         Row(Modifier.fillMaxWidth().height(52.dp)) {
-            ConversationTab("会话", state.conversationPage == ConversationPage.CONVERSATION, Modifier.weight(1f).testTag("show-conversation"), onShowConversation)
-            ConversationTab("项目文件", state.conversationPage == ConversationPage.WORKSPACE, Modifier.weight(1f).testTag("show-workspace"), onShowWorkspace)
+            ConversationTab("会话", selectedPage == ConversationSurfacePage.CONVERSATION, Modifier.weight(1f).testTag("show-conversation"), ::showConversation)
+            ConversationTab("项目文件", selectedPage == ConversationSurfacePage.WORKSPACE, Modifier.weight(1f).testTag("show-workspace"), ::showWorkspace)
+            ConversationTab("任务上下文", selectedPage == ConversationSurfacePage.CONTEXT, Modifier.weight(1f).testTag("show-task-context")) {
+                selectedPage = ConversationSurfacePage.CONTEXT
+            }
         }
         HorizontalDivider(color = CodexColors.Border)
         Row(
@@ -893,10 +917,11 @@ private fun ConversationScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.width(if (state.conversationPage == ConversationPage.CONVERSATION) 32.dp else 18.dp).height(4.dp).clip(CircleShape).background(if (state.conversationPage == ConversationPage.CONVERSATION) CodexColors.Indigo else CodexColors.Border))
-            Box(Modifier.width(if (state.conversationPage == ConversationPage.WORKSPACE) 32.dp else 18.dp).height(4.dp).clip(CircleShape).background(if (state.conversationPage == ConversationPage.WORKSPACE) CodexColors.Indigo else CodexColors.Border))
+            ConversationPageIndicator(selectedPage == ConversationSurfacePage.CONVERSATION)
+            ConversationPageIndicator(selectedPage == ConversationSurfacePage.WORKSPACE)
+            ConversationPageIndicator(selectedPage == ConversationSurfacePage.CONTEXT)
         }
-        if (state.conversationPage == ConversationPage.CONVERSATION) {
+        if (selectedPage == ConversationSurfacePage.CONVERSATION) {
             Column(
                 Modifier.weight(1f).fillMaxWidth().testTag("conversation-screen")
                     .semantics { contentDescription = "会话页面" },
@@ -964,7 +989,7 @@ private fun ConversationScreen(
                     }
                 }
             }
-        } else {
+        } else if (selectedPage == ConversationSurfacePage.WORKSPACE) {
             WorkspaceScreen(
                 state,
                 Modifier.weight(1f).fillMaxWidth(),
@@ -975,6 +1000,177 @@ private fun ConversationScreen(
                 onCloseWorkspaceEditor,
                 onChooseWorkspaceUpload,
                 onChooseWorkspaceDownload,
+            )
+        } else {
+            TaskContextScreen(state, Modifier.weight(1f).fillMaxWidth())
+        }
+    }
+}
+
+private enum class ConversationSurfacePage { CONVERSATION, WORKSPACE, CONTEXT }
+
+private fun ConversationPage.toConversationSurfacePage() = when (this) {
+    ConversationPage.CONVERSATION -> ConversationSurfacePage.CONVERSATION
+    ConversationPage.WORKSPACE -> ConversationSurfacePage.WORKSPACE
+}
+
+@Composable
+private fun ConversationPageIndicator(selected: Boolean) {
+    Box(
+        Modifier.width(if (selected) 32.dp else 18.dp).height(4.dp).clip(CircleShape)
+            .background(if (selected) CodexColors.Indigo else CodexColors.Border),
+    )
+}
+
+internal data class TaskContextIdentifier(val label: String, val value: String)
+
+internal data class TaskContextSnapshot(
+    val cwd: String = "",
+    val codexStatus: String = "",
+    val activeTurnId: String = "",
+    val pendingApprovalCount: Int = 0,
+    val pendingInputCount: Int = 0,
+    val fileChanges: List<FileChange> = emptyList(),
+    val warnings: List<String> = emptyList(),
+    val identifiers: List<TaskContextIdentifier> = emptyList(),
+    val hasCodex: Boolean = false,
+)
+
+internal fun taskContextSnapshot(state: AppUiState): TaskContextSnapshot {
+    val codex = state.core.codexes.firstOrNull { it.id == state.openCodexId }
+    val conversation = activeConversation(state)
+    val activeTurnId = conversation?.activeTurnId.orEmpty().ifBlank { codex?.activeTurnId.orEmpty() }
+    val activeTurn = conversation?.turns?.firstOrNull { it.turnId == activeTurnId }
+    val requests = conversation?.pendingRequests.orEmpty().filterNot { it.resolved }
+    val changes = activeTurn?.items.orEmpty().flatMap { it.fileChange?.changes.orEmpty() }
+        .distinctBy { listOf(it.kind, it.path, it.oldPath, it.newPath) }
+    val warnings = buildList {
+        state.core.error.takeIf { it.isNotBlank() }?.let(::add)
+        codex?.let { addAll(codexUiProtocolNotices(it)) }
+        activeTurn?.completeness?.chineseNotice()?.let(::add)
+        if (activeTurn != null) {
+            timelineTurnProvenanceNotice(activeTurn, codex?.importedAtUnixMs ?: 0)?.let(::add)
+            activeTurn.items.flatMapTo(this) { item ->
+                item.protocolNotices().filterNot {
+                    it == "来自导入的历史记录" || it == "由 Host 重建"
+                }
+            }
+        }
+        conversation?.pendingWatch?.error?.let { add("等待处理请求时出错：${pendingErrorDescription(it)}") }
+        requests.mapNotNullTo(this) { request ->
+            request.error?.let { "请求处理失败：${pendingErrorDescription(it)}" }
+        }
+    }.map(String::trim).filter(String::isNotBlank).distinct()
+    val identifiers = buildList {
+        codex?.id?.takeIf { it.isNotBlank() }?.let { add(TaskContextIdentifier("Codex ID", it)) }
+        requests.mapNotNullTo(this) { request ->
+            request.requestId.takeIf { it.isNotBlank() }?.let { TaskContextIdentifier("待处理请求 ID", it) }
+        }
+    }.distinctBy { it.label to it.value }
+    return TaskContextSnapshot(
+        cwd = codex?.cwd.orEmpty(),
+        codexStatus = codex?.let { codexStatusDescription(it.managementState, it.status) }.orEmpty(),
+        activeTurnId = activeTurnId,
+        pendingApprovalCount = requests.count { it.type == "approval" },
+        pendingInputCount = requests.count { it.type == "user_input" },
+        fileChanges = changes,
+        warnings = warnings,
+        identifiers = identifiers,
+        hasCodex = codex != null || conversation != null,
+    )
+}
+
+@Composable
+internal fun TaskContextScreen(state: AppUiState, modifier: Modifier = Modifier) {
+    val snapshot = taskContextSnapshot(state)
+    LazyColumn(
+        modifier.background(CodexColors.Graphite).testTag("task-context-page")
+            .semantics { contentDescription = "任务上下文页面" },
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (!snapshot.hasCodex) {
+            item {
+                TaskContextCard("暂无任务上下文") {
+                    Text("打开一个 Codex 会话后，可在这里查看当前任务状态。", color = CodexColors.TextMuted)
+                }
+            }
+        } else {
+            item {
+                TaskContextCard("当前任务") {
+                    TaskContextValue("工作目录", snapshot.cwd.ifBlank { "未提供" }, "task-context-cwd")
+                    TaskContextValue("Codex 状态", snapshot.codexStatus.ifBlank { "未知" }, "task-context-status")
+                    TaskContextValue("活动 Turn ID", snapshot.activeTurnId.ifBlank { "当前没有活动 turn" }, "task-context-turn-id")
+                }
+            }
+            item {
+                TaskContextCard("待处理") {
+                    Text(
+                        "待审批 ${snapshot.pendingApprovalCount} · 待输入 ${snapshot.pendingInputCount}",
+                        Modifier.testTag("task-context-pending-counts"),
+                    )
+                }
+            }
+            item {
+                TaskContextCard("当前 turn 文件变化") {
+                    if (snapshot.fileChanges.isEmpty()) {
+                        Text("当前 turn 暂无文件变化", color = CodexColors.TextMuted)
+                    } else snapshot.fileChanges.forEach { change ->
+                        val path = when {
+                            change.oldPath.isNotBlank() && change.newPath.isNotBlank() -> "${change.oldPath} → ${change.newPath}"
+                            change.path.isNotBlank() -> change.path
+                            change.newPath.isNotBlank() -> change.newPath
+                            else -> change.oldPath
+                        }
+                        TaskContextValue(fileKindDescription(change.kind), path.ifBlank { "未知文件" })
+                    }
+                }
+            }
+            item {
+                TaskContextCard("警告与标识") {
+                    if (snapshot.warnings.isEmpty() && snapshot.identifiers.isEmpty()) {
+                        Text("暂无警告或标识", color = CodexColors.TextMuted)
+                    } else {
+                        snapshot.warnings.forEach { warning ->
+                            Text(
+                                "警告 · $warning",
+                                color = CodexColors.Amber,
+                                modifier = Modifier.testTag("task-context-warning"),
+                            )
+                        }
+                        snapshot.identifiers.forEach { identifier ->
+                            TaskContextValue(identifier.label, identifier.value, "task-context-identifier")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskContextCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        Modifier.fillMaxWidth().border(1.dp, CodexColors.Border, MaterialTheme.shapes.medium),
+        color = CodexColors.Charcoal,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            content()
+        }
+    }
+}
+
+@Composable
+private fun TaskContextValue(label: String, value: String, tag: String? = null) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = CodexColors.TextMuted)
+        SelectionContainer {
+            Text(
+                value,
+                modifier = if (tag == null) Modifier else Modifier.testTag(tag),
+                style = MaterialTheme.typography.bodyMedium,
             )
         }
     }
@@ -1425,7 +1621,7 @@ internal fun ConversationHistory(core: CoreState, openCodexId: String?, modifier
                     listState.scrollToItem(0)
                 }
                 LazyColumn(
-                    Modifier.fillMaxSize(),
+                    Modifier.fillMaxSize().testTag("conversation-history-list"),
                     state = listState,
                     reverseLayout = true,
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 18.dp),

@@ -365,7 +365,7 @@ func TestProtocolPendingWatchAndResponses(t *testing.T) {
 		approval := pendingProtoApproval("A1", remotev1.ApprovalStatus_APPROVAL_STATUS_PENDING, remotev1.ApprovalDecision_APPROVAL_DECISION_UNSPECIFIED)
 		userInput := pendingProtoUserInputMany("U1", false, 20)
 		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: watch.RequestId, Result: &remotev1.Response_WatchCodex{WatchCodex: &remotev1.WatchCodexResponse{
-			CodexId: "CODEX-1", Mode: remotev1.WatchMode_WATCH_MODE_RESET, HeadEventSeq: 5,
+			CodexId: "CODEX-1", Mode: remotev1.WatchMode_WATCH_MODE_RESET, HeadEventSeq: 5, ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH,
 			ResetView: &remotev1.CurrentView{Codex: &remotev1.Codex{CodexId: "CODEX-1"}, HeadEventSeq: 5, PendingRequests: []*remotev1.PendingRequest{approval, userInput}},
 		}}}}})
 		// Events deliberately arrive before the caller has processed RESET.
@@ -405,7 +405,7 @@ func TestProtocolPendingWatchAndResponses(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	reset, stream, err := client.WatchPending(ctx, "CODEX-1")
+	reset, stream, err := client.WatchPending(ctx, "CODEX-1", nil)
 	if err != nil || reset.HeadEventSeq != 5 || len(reset.Requests) != 2 || reset.Requests[0].Approval == nil || reset.Requests[1].UserInput == nil || len(reset.Requests[1].UserInput.Questions) != 20 {
 		t.Fatalf("WatchPending reset=%+v err=%v", reset, err)
 	}
@@ -431,6 +431,101 @@ func TestProtocolPendingWatchAndResponses(t *testing.T) {
 	}
 	if err := client.UnwatchPending(ctx, stream); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProtocolWatchResumedKeepsRequestedCursorUntilReplayIsReduced(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{WebSocketSubprotocol}})
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		_ = readTestFrame(t, ctx, conn)
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_ServerHello{ServerHello: completeServerHello(2)}})
+		request := readTestFrame(t, ctx, conn).GetRequest()
+		watch := request.GetWatchCodex()
+		if watch.GetCodexId() != "C1" || watch.AfterEventSeq == nil || watch.GetAfterEventSeq() != 5 || watch.GetAfterHostRunId() != "run" {
+			t.Errorf("WatchCodex=%+v", watch)
+			return
+		}
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: request.RequestId, Result: &remotev1.Response_WatchCodex{WatchCodex: &remotev1.WatchCodexResponse{CodexId: "C1", Mode: remotev1.WatchMode_WATCH_MODE_RESUMED, HeadEventSeq: 7, ReplayFromEventSeq: 6}}}}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Event{Event: &remotev1.Event{CodexId: "C1", EventSeq: 6}}})
+		writeTestFrame(t, ctx, conn, &remotev1.Frame{Payload: &remotev1.Frame_Event{Event: &remotev1.Event{CodexId: "C1", EventSeq: 7}}})
+		<-ctx.Done()
+	}))
+	defer server.Close()
+	addr := server.Listener.Addr().String()
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := dialProtocol(ctx, configPayload{HostEndpoint: "fake-host", ClientID: "client", ClientRunID: "run"}, dial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	start, stream, err := client.WatchPending(ctx, "C1", &pendingWatchCursor{HostRunID: "run", EventSeq: 5})
+	if err != nil || start.Mode != "resumed" || start.HeadEventSeq != 5 || start.HostRunID != "run" {
+		t.Fatalf("start=%+v err=%v", start, err)
+	}
+	for want := uint64(6); want <= 7; want++ {
+		event, err := stream.Next(ctx)
+		if err != nil || event.EventSeq != want {
+			t.Fatalf("event=%+v err=%v want=%d", event, err, want)
+		}
+	}
+}
+
+func TestValidateWatchResponseResetReasonAndCursorOverflow(t *testing.T) {
+	value := func(v uint64) *uint64 { return &v }
+	reset := func(reason remotev1.WatchResetReason) *remotev1.WatchCodexResponse {
+		return &remotev1.WatchCodexResponse{
+			CodexId: "C1", Mode: remotev1.WatchMode_WATCH_MODE_RESET, HeadEventSeq: 9, ResetReason: reason,
+			ResetView: &remotev1.CurrentView{Codex: &remotev1.Codex{CodexId: "C1"}, HeadEventSeq: 9},
+		}
+	}
+	resumed := func(cursor, replay uint64, reason remotev1.WatchResetReason) *remotev1.WatchCodexResponse {
+		return &remotev1.WatchCodexResponse{CodexId: "C1", Mode: remotev1.WatchMode_WATCH_MODE_RESUMED, HeadEventSeq: cursor, ReplayFromEventSeq: replay, ResetReason: reason}
+	}
+	cursorless := &remotev1.WatchCodexRequest{CodexId: "C1"}
+	sameRun := &remotev1.WatchCodexRequest{CodexId: "C1", AfterEventSeq: value(5), AfterHostRunId: "RUN"}
+	crossRun := &remotev1.WatchCodexRequest{CodexId: "C1", AfterEventSeq: value(5), AfterHostRunId: "OLD"}
+	maxCursor := &remotev1.WatchCodexRequest{CodexId: "C1", AfterEventSeq: value(^uint64(0)), AfterHostRunId: "RUN"}
+	tests := []struct {
+		name    string
+		request *remotev1.WatchCodexRequest
+		result  *remotev1.WatchCodexResponse
+		wantErr string
+	}{
+		{name: "cursorless initial", request: cursorless, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH)},
+		{name: "cursorless missing reason", request: cursorless, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_UNSPECIFIED), wantErr: "no reset_reason"},
+		{name: "cursorless wrong reason", request: cursorless, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_CURSOR_UNAVAILABLE), wantErr: "must be INITIAL_WATCH"},
+		{name: "cross run restarted", request: crossRun, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_HOST_RESTARTED)},
+		{name: "cross run wrong reason", request: crossRun, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_CURSOR_UNAVAILABLE), wantErr: "must be HOST_RESTARTED"},
+		{name: "same run unavailable", request: sameRun, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_CURSOR_UNAVAILABLE)},
+		{name: "same run invalid", request: sameRun, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_CURSOR_INVALID)},
+		{name: "same run initial rejected", request: sameRun, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH), wantErr: "CURSOR_UNAVAILABLE or CURSOR_INVALID"},
+		{name: "same run restarted rejected", request: sameRun, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_HOST_RESTARTED), wantErr: "CURSOR_UNAVAILABLE or CURSOR_INVALID"},
+		{name: "same run unknown rejected", request: sameRun, result: reset(remotev1.WatchResetReason(99)), wantErr: "CURSOR_UNAVAILABLE or CURSOR_INVALID"},
+		{name: "resumed", request: sameRun, result: resumed(5, 6, remotev1.WatchResetReason_WATCH_RESET_REASON_UNSPECIFIED)},
+		{name: "resumed reason rejected", request: sameRun, result: resumed(5, 6, remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH), wantErr: "unexpectedly contains RESET data"},
+		{name: "resumed overflow rejected", request: maxCursor, result: resumed(^uint64(0), 0, remotev1.WatchResetReason_WATCH_RESET_REASON_UNSPECIFIED), wantErr: "does not follow cursor"},
+		{name: "unpaired cursor rejected", request: &remotev1.WatchCodexRequest{CodexId: "C1", AfterEventSeq: value(5)}, result: reset(remotev1.WatchResetReason_WATCH_RESET_REASON_CURSOR_INVALID), wantErr: "not paired"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateWatchResponse(test.result, test.request, "RUN", "C1")
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error=%v, want containing %q", err, test.wantErr)
+			}
+		})
 	}
 }
 

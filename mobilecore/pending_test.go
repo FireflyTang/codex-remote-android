@@ -39,7 +39,7 @@ func newPendingFakeSession() *pendingFakeSession {
 	}
 }
 
-func (s *pendingFakeSession) WatchPending(ctx context.Context, codexID string) (pendingWatchReset, *protocolPendingWatch, error) {
+func (s *pendingFakeSession) WatchPending(ctx context.Context, codexID string, _ *pendingWatchCursor) (pendingWatchReset, *protocolPendingWatch, error) {
 	select {
 	case <-ctx.Done():
 		return pendingWatchReset{}, nil, ctx.Err()
@@ -110,7 +110,7 @@ func TestPendingWatchAdvancesAllEventsAndResetPreservesInFlight(t *testing.T) {
 	sess.approvalStarted = make(chan struct{})
 	sess.approvalRelease = make(chan struct{})
 	sess.approvalResult = pendingResponseResult{Type: "approval", RequestID: "A1", TurnID: "TURN-1", ItemID: "ITEM-1"}
-	sess.resets <- pendingWatchReset{HeadEventSeq: 10, Requests: []pendingRequest{approvalPendingRequest("A1")}}
+	sess.resets <- pendingWatchReset{ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH, HeadEventSeq: 10, Requests: []pendingRequest{approvalPendingRequest("A1")}}
 
 	c := NewCore(new(fakePlatform))
 	c.session, c.state.Phase = sess, "ready"
@@ -131,7 +131,7 @@ func TestPendingWatchAdvancesAllEventsAndResetPreservesInFlight(t *testing.T) {
 
 	// A true gap fails closed and rebuilds from RESET. The rebuilt request must
 	// retain the local response state instead of becoming actionable twice.
-	sess.resets <- pendingWatchReset{HeadEventSeq: 12, Requests: []pendingRequest{approvalPendingRequest("A1")}}
+	sess.resets <- pendingWatchReset{ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH, HeadEventSeq: 12, Requests: []pendingRequest{approvalPendingRequest("A1")}}
 	watch.inbox <- &remotev1.Event{CodexId: "CODEX-1", EventSeq: 12}
 	rebuilt := <-sess.watches
 	waitState(t, c, func(state state) bool {
@@ -158,7 +158,7 @@ func TestPendingResponseFailureSurvivesResetAndUserInputValidation(t *testing.T)
 	sess := newPendingFakeSession()
 	sess.approvalErr = &pendingProtocolError{Code: "workspace_busy", Message: "busy"}
 	sess.userInputResult = pendingResponseResult{Type: "user_input", RequestID: "U1", TurnID: "TURN-2", ItemID: "ITEM-2"}
-	sess.resets <- pendingWatchReset{HeadEventSeq: 20, Requests: []pendingRequest{approvalPendingRequest("A1"), userInputPendingRequest("U1")}}
+	sess.resets <- pendingWatchReset{ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH, HeadEventSeq: 20, Requests: []pendingRequest{approvalPendingRequest("A1"), userInputPendingRequest("U1")}}
 
 	c := NewCore(new(fakePlatform))
 	c.session, c.state.Phase = sess, "ready"
@@ -186,7 +186,7 @@ func TestPendingResponseFailureSurvivesResetAndUserInputValidation(t *testing.T)
 		return index >= 0 && state.Conversation.PendingRequests[index].Error != nil && state.Conversation.PendingRequests[index].Error.Code == "workspace_busy"
 	})
 
-	sess.resets <- pendingWatchReset{HeadEventSeq: 22, Requests: []pendingRequest{approvalPendingRequest("A1"), userInputPendingRequest("U1")}}
+	sess.resets <- pendingWatchReset{ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH, HeadEventSeq: 22, Requests: []pendingRequest{approvalPendingRequest("A1"), userInputPendingRequest("U1")}}
 	watch.inbox <- &remotev1.Event{CodexId: "CODEX-1", EventSeq: 22}
 	rebuilt := <-sess.watches
 	waitState(t, c, func(state state) bool {
@@ -213,8 +213,8 @@ func TestPendingResponseFailureSurvivesResetAndUserInputValidation(t *testing.T)
 
 func TestPendingWatchSwitchAndStopDiscardOldStream(t *testing.T) {
 	sess := newPendingFakeSession()
-	sess.resets <- pendingWatchReset{HeadEventSeq: 1, Requests: []pendingRequest{approvalPendingRequest("OLD")}}
-	sess.resets <- pendingWatchReset{HeadEventSeq: 8, Requests: []pendingRequest{approvalPendingRequest("NEW")}}
+	sess.resets <- pendingWatchReset{ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH, HeadEventSeq: 1, Requests: []pendingRequest{approvalPendingRequest("OLD")}}
+	sess.resets <- pendingWatchReset{ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH, HeadEventSeq: 8, Requests: []pendingRequest{approvalPendingRequest("NEW")}}
 	c := NewCore(new(fakePlatform))
 	c.session, c.state.Phase = sess, "ready"
 
@@ -256,12 +256,11 @@ func TestPendingWatchSwitchAndStopDiscardOldStream(t *testing.T) {
 	}
 }
 
-func TestPendingWatchOldOrDuplicateSequenceRebuildsFromReset(t *testing.T) {
+func TestPendingWatchOldOrDuplicateSequenceIsIgnoredWithoutRebuild(t *testing.T) {
 	for _, sequence := range []uint64{4, 5} {
 		t.Run(fmt.Sprintf("sequence_%d", sequence), func(t *testing.T) {
 			sess := newPendingFakeSession()
-			sess.resets <- pendingWatchReset{HeadEventSeq: 5, Requests: []pendingRequest{approvalPendingRequest("OLD")}}
-			sess.resets <- pendingWatchReset{HeadEventSeq: 7, Requests: []pendingRequest{approvalPendingRequest("NEW")}}
+			sess.resets <- pendingWatchReset{ResetReason: remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH, HeadEventSeq: 5, Requests: []pendingRequest{approvalPendingRequest("OLD")}}
 			c := NewCore(new(fakePlatform))
 			c.session, c.state.Phase = sess, "ready"
 			t.Cleanup(func() { c.stop("cleanup") })
@@ -272,14 +271,16 @@ func TestPendingWatchOldOrDuplicateSequenceRebuildsFromReset(t *testing.T) {
 				return state.Conversation != nil && state.Conversation.PendingWatch.State == "watching" && state.Conversation.PendingWatch.HeadEventSeq == 5
 			})
 			watch.inbox <- &remotev1.Event{CodexId: "CODEX-1", EventSeq: sequence}
+			time.Sleep(20 * time.Millisecond)
+			state := decodeState(t, c.State())
+			if state.Conversation.PendingWatch.HeadEventSeq != 5 || pendingIndex(state.Conversation.PendingRequests, "OLD") < 0 {
+				t.Fatalf("duplicate changed watch state: %+v", state.Conversation)
+			}
 			select {
 			case <-sess.watches:
-			case <-time.After(time.Second):
-				t.Fatal("old/duplicate sequence was silently ignored instead of rebuilding")
+				t.Fatal("duplicate unexpectedly rebuilt the watch")
+			default:
 			}
-			waitState(t, c, func(state state) bool {
-				return state.Conversation.PendingWatch.State == "watching" && state.Conversation.PendingWatch.HeadEventSeq == 7 && pendingIndex(state.Conversation.PendingRequests, "NEW") >= 0 && pendingIndex(state.Conversation.PendingRequests, "OLD") < 0
-			})
 		})
 	}
 }

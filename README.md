@@ -22,13 +22,19 @@
 - 会话历史、Markdown 消息、reasoning、plan、command、diff 和失败状态组成的 rich timeline，支持发送和中断回合。
 - approval 和 user-input 待处理请求的展示与回复。
 - workspace 目录浏览、文本文件查看/编辑，以及通过 Android SAF 上传普通文件或 ZIP、下载文件或目录 ZIP。
+- 当前会话通过 Host watch 事件实时更新；连接中断重连后会从已知位置继续，并在回合结束后校准历史。
+- 按 Codex 分别保存未发送草稿和最后打开的会话，应用进程重建后可恢复到原会话。
+- 对话和项目文件之外新增“任务上下文”页，集中展示 cwd、Codex/turn 状态、待处理请求、当前 turn 文件变化以及去重后的警告与标识。
 
 ## 验证范围
 
-最近一次完整自动化基线为：MobileCore Go 72 项全量与 `-race` 均通过、JVM 117/117、
-API 36 x86_64 低内存模拟器 connected suite 47/47。模拟器覆盖连接与错误状态、项目目录和
-session 可用性、会话管理、rich timeline、pending request、workspace/SAF 边界、
-诊断导出以及前台恢复状态流。
+当前 v0.3.0 候选版本的 MobileCore Go 全量与 `-race` 测试均通过；普通
+`go test -json -count=1 ./...` 运行共有 132 个通过的 Test/subtest 事件；JVM 129/129、
+API 36 x86_64 低资源模拟器 connected suite 51/51。connected 稳定配置为 1536 MiB、
+2 核、720x1600@320、SwiftShader GLES 并明确禁用 Vulkan；emulator 实际 guest
+`MemTotal` 约 2532296 kB。
+现有自动化覆盖连接与错误状态、项目目录和 session 可用性、会话管理、rich timeline、
+pending request、workspace/SAF 边界、诊断导出、前台恢复、进程重建恢复及任务上下文页。
 
 应用离开前台至少 10 秒后再次回到前台时，会先单次刷新；刷新失败时，最多执行一次标准
 stop/config/start，并重新选择原来打开的 Codex。运行中的回合、待审批/用户输入和正在
@@ -48,9 +54,9 @@ APK 中 arm64 native ELF 的 `LOAD` segment 对齐为 `0x4000`，且该 native �
 
 ## 下载 APK
 
-当前个人 Demo 可从 [GitHub Release v0.2.0](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.2.0)
-下载 `codex-remote-android-v0.2.0-debug.apk`，或使用
-[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.2.0/codex-remote-android-v0.2.0-debug.apk)。
+当前个人 Demo 可从 [GitHub Release v0.3.0](https://github.com/FireflyTang/codex-remote-android/releases/tag/v0.3.0)
+下载 `codex-remote-android-v0.3.0-debug.apk`，或使用
+[APK 直链](https://github.com/FireflyTang/codex-remote-android/releases/download/v0.3.0/codex-remote-android-v0.3.0-debug.apk)。
 这是便于试用的 debug APK，并非商店签名的正式发行包。
 
 ## 构建

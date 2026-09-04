@@ -28,8 +28,19 @@ type responseResult struct {
 var errHostConnectionClosed = errors.New("Host connection closed")
 
 type pendingWatchReset struct {
+	Mode         string
+	HostRunID    string
+	ResetReason  remotev1.WatchResetReason
 	HeadEventSeq uint64
 	Requests     []pendingRequest
+	ActiveTurn   *conversationTurn
+	Codex        *remotev1.Codex
+	Workspace    *workspaceAccessState
+}
+
+type pendingWatchCursor struct {
+	HostRunID string
+	EventSeq  uint64
 }
 
 type pendingWatchEvent struct {
@@ -39,6 +50,7 @@ type pendingWatchEvent struct {
 	RequestID  string
 	Actionable bool
 	Request    pendingRequest
+	Proto      *remotev1.Event
 }
 
 type pendingResponseResult struct {
@@ -653,31 +665,31 @@ func validateWorkspaceDownloadAssociation(relativePath string, entry *remotev1.W
 }
 
 func (s *liveSession) WorkspaceSupport() (workspaceLimits, bool, error) {
-	return s.client.WorkspaceSupport()
+	return s.currentClient().WorkspaceSupport()
 }
 
 func (s *liveSession) GetWorkspace(ctx context.Context, codexID string) (workspaceDescriptor, error) {
-	return s.client.GetWorkspace(ctx, codexID)
+	return s.currentClient().GetWorkspace(ctx, codexID)
 }
 
 func (s *liveSession) ListWorkspaceEntries(ctx context.Context, codexID, relativeDirectory string) (workspaceDirectory, error) {
-	return s.client.ListWorkspaceEntries(ctx, codexID, relativeDirectory)
+	return s.currentClient().ListWorkspaceEntries(ctx, codexID, relativeDirectory)
 }
 
 func (s *liveSession) ReadWorkspaceTextFile(ctx context.Context, codexID, relativePath string) (workspaceOpenFile, error) {
-	return s.client.ReadWorkspaceTextFile(ctx, codexID, relativePath)
+	return s.currentClient().ReadWorkspaceTextFile(ctx, codexID, relativePath)
 }
 
 func (s *liveSession) WriteWorkspaceTextFile(ctx context.Context, p writeWorkspaceTextFilePayload) (workspaceWriteResult, error) {
-	return s.client.WriteWorkspaceTextFile(ctx, p)
+	return s.currentClient().WriteWorkspaceTextFile(ctx, p)
 }
 
 func (s *liveSession) UploadWorkspaceEntry(ctx context.Context, p workspaceUploadRequest) (workspaceUploadResult, error) {
-	return s.client.UploadWorkspaceEntry(ctx, p)
+	return s.currentClient().UploadWorkspaceEntry(ctx, p)
 }
 
 func (s *liveSession) DownloadWorkspaceEntry(ctx context.Context, codexID, relativePath string) (workspaceDownloadResult, error) {
-	return s.client.DownloadWorkspaceEntry(ctx, codexID, relativePath)
+	return s.currentClient().DownloadWorkspaceEntry(ctx, codexID, relativePath)
 }
 
 func workspaceAccessStateFromProto(access *remotev1.WorkspaceAccessState) *workspaceAccessState {
@@ -848,7 +860,7 @@ func (c *protocolClient) InterruptTurn(ctx context.Context, codexID, turnID stri
 	return result.TurnId, nil
 }
 
-func (c *protocolClient) WatchPending(ctx context.Context, codexID string) (pendingWatchReset, *protocolPendingWatch, error) {
+func (c *protocolClient) WatchPending(ctx context.Context, codexID string, cursor *pendingWatchCursor) (pendingWatchReset, *protocolPendingWatch, error) {
 	watch := &protocolPendingWatch{client: c, codexID: codexID, inbox: make(chan *remotev1.Event, 64), overflow: make(chan struct{})}
 	c.mu.Lock()
 	if c.closed {
@@ -863,7 +875,12 @@ func (c *protocolClient) WatchPending(ctx context.Context, codexID string) (pend
 	// after the response and must not race sink installation.
 	c.eventSink = watch
 	c.mu.Unlock()
-	resp, err := c.call(ctx, &remotev1.Request{Request: &remotev1.Request_WatchCodex{WatchCodex: &remotev1.WatchCodexRequest{CodexId: codexID}}})
+	request := &remotev1.WatchCodexRequest{CodexId: codexID}
+	if cursor != nil && cursor.HostRunID != "" {
+		request.AfterEventSeq = proto.Uint64(cursor.EventSeq)
+		request.AfterHostRunId = cursor.HostRunID
+	}
+	resp, err := c.call(ctx, &remotev1.Request{Request: &remotev1.Request_WatchCodex{WatchCodex: request}})
 	if err != nil {
 		c.detachPendingWatch(watch)
 		return pendingWatchReset{}, nil, fmt.Errorf("WatchCodex: %w", err)
@@ -873,16 +890,83 @@ func (c *protocolClient) WatchPending(ctx context.Context, codexID string) (pend
 		return pendingWatchReset{}, nil, pendingHostError("WatchCodex", resp.GetError())
 	}
 	result := resp.GetWatchCodex()
-	if result == nil || result.CodexId != codexID || result.Mode != remotev1.WatchMode_WATCH_MODE_RESET || result.ResetView == nil || result.ResetView.Codex == nil || result.ResetView.Codex.CodexId != codexID || result.HeadEventSeq != result.ResetView.HeadEventSeq {
+	if err := validateWatchResponse(result, request, c.hello.HostRunId, codexID); err != nil {
 		c.detachPendingWatch(watch)
-		return pendingWatchReset{}, nil, fmt.Errorf("WatchCodex initial response is not a strictly associated RESET")
+		return pendingWatchReset{}, nil, err
 	}
-	requests, err := pendingRequestsFromProto(result.ResetView.PendingRequests)
-	if err != nil {
-		c.detachPendingWatch(watch)
-		return pendingWatchReset{}, nil, fmt.Errorf("WatchCodex RESET pending requests: %w", err)
+	out := pendingWatchReset{HostRunID: c.hello.HostRunId, HeadEventSeq: result.HeadEventSeq, ResetReason: result.ResetReason}
+	switch result.Mode {
+	case remotev1.WatchMode_WATCH_MODE_RESET:
+		requests, err := pendingRequestsFromProto(result.ResetView.PendingRequests)
+		if err != nil {
+			c.detachPendingWatch(watch)
+			return pendingWatchReset{}, nil, fmt.Errorf("WatchCodex RESET pending requests: %w", err)
+		}
+		out.Mode, out.Requests = "reset", requests
+		out.Codex = result.ResetView.Codex
+		out.Workspace = workspaceAccessStateFromProto(result.ResetView.WorkspaceAccessState)
+		if active := result.ResetView.ActiveTurn; active != nil {
+			projected := conversationTurnFromProto(active)
+			out.ActiveTurn = &projected
+		}
+	case remotev1.WatchMode_WATCH_MODE_RESUMED:
+		// The response head describes the replay range's upper bound. Reduction
+		// must resume at the requested cursor and consume every queued event.
+		out.Mode, out.HeadEventSeq = "resumed", cursor.EventSeq
 	}
-	return pendingWatchReset{HeadEventSeq: result.HeadEventSeq, Requests: requests}, watch, nil
+	return out, watch, nil
+}
+
+func validateWatchResponse(result *remotev1.WatchCodexResponse, request *remotev1.WatchCodexRequest, hostRunID, codexID string) error {
+	if result == nil || request == nil || result.CodexId != codexID || request.CodexId != codexID || hostRunID == "" {
+		return fmt.Errorf("WatchCodex returned mismatched response")
+	}
+	hasCursor := request.AfterEventSeq != nil
+	if hasCursor != (request.AfterHostRunId != "") {
+		return fmt.Errorf("WatchCodex request cursor is not paired")
+	}
+	switch result.Mode {
+	case remotev1.WatchMode_WATCH_MODE_RESET:
+		if result.ResetView == nil || result.ResetView.Codex == nil || result.ResetView.Codex.CodexId != codexID || result.HeadEventSeq != result.ResetView.HeadEventSeq {
+			return fmt.Errorf("WatchCodex RESET is not strictly associated")
+		}
+		if result.ResetReason == remotev1.WatchResetReason_WATCH_RESET_REASON_UNSPECIFIED {
+			return fmt.Errorf("WatchCodex RESET has no reset_reason")
+		}
+		if !hasCursor {
+			if result.ResetReason != remotev1.WatchResetReason_WATCH_RESET_REASON_INITIAL_WATCH {
+				return fmt.Errorf("cursorless WatchCodex RESET must be INITIAL_WATCH")
+			}
+			return nil
+		}
+		if request.AfterHostRunId != hostRunID {
+			if result.ResetReason != remotev1.WatchResetReason_WATCH_RESET_REASON_HOST_RESTARTED {
+				return fmt.Errorf("cross-run WatchCodex RESET must be HOST_RESTARTED")
+			}
+			return nil
+		}
+		if result.ResetReason != remotev1.WatchResetReason_WATCH_RESET_REASON_CURSOR_UNAVAILABLE && result.ResetReason != remotev1.WatchResetReason_WATCH_RESET_REASON_CURSOR_INVALID {
+			return fmt.Errorf("same-run cursor WatchCodex RESET must be CURSOR_UNAVAILABLE or CURSOR_INVALID")
+		}
+		return nil
+	case remotev1.WatchMode_WATCH_MODE_RESUMED:
+		if !hasCursor || request.AfterHostRunId != hostRunID {
+			return fmt.Errorf("WatchCodex RESUMED has no same-run paired cursor")
+		}
+		cursor := request.GetAfterEventSeq()
+		if result.HeadEventSeq < cursor {
+			return fmt.Errorf("WatchCodex RESUMED head precedes cursor")
+		}
+		if cursor == ^uint64(0) || result.ReplayFromEventSeq != cursor+1 {
+			return fmt.Errorf("WatchCodex RESUMED replay range does not follow cursor")
+		}
+		if result.ResetView != nil || result.ResetReason != remotev1.WatchResetReason_WATCH_RESET_REASON_UNSPECIFIED {
+			return fmt.Errorf("WatchCodex RESUMED unexpectedly contains RESET data")
+		}
+		return nil
+	default:
+		return fmt.Errorf("WatchCodex returned unspecified mode")
+	}
 }
 
 func (c *protocolClient) UnwatchPending(ctx context.Context, watch *protocolPendingWatch) error {
@@ -916,7 +1000,7 @@ func (w *protocolPendingWatch) Next(ctx context.Context) (pendingWatchEvent, err
 	case <-ctx.Done():
 		return pendingWatchEvent{}, ctx.Err()
 	case <-w.client.ctx.Done():
-		return pendingWatchEvent{}, fmt.Errorf("Host connection closed")
+		return pendingWatchEvent{}, errHostConnectionClosed
 	case <-w.overflow:
 		return pendingWatchEvent{}, fmt.Errorf("watch event inbox overflow")
 	case event := <-w.inbox:
@@ -986,7 +1070,7 @@ func pendingWatchEventFromProto(event *remotev1.Event) (pendingWatchEvent, error
 	if event == nil || event.CodexId == "" || event.EventSeq == 0 {
 		return pendingWatchEvent{}, fmt.Errorf("invalid Event envelope")
 	}
-	out := pendingWatchEvent{CodexID: event.CodexId, EventSeq: event.EventSeq}
+	out := pendingWatchEvent{CodexID: event.CodexId, EventSeq: event.EventSeq, Proto: event}
 	updated := event.GetPendingRequestUpdated()
 	if updated == nil {
 		return out, nil
@@ -1247,7 +1331,7 @@ func setConversationActivity(conversation *conversationState) {
 	conversation.ActiveTurnID = ""
 	conversation.Running = false
 	for _, turn := range conversation.Turns {
-		if turn.Status == "running" {
+		if turn.Status == "running" && !conversation.SuppressedActiveTurnIDs[turn.TurnID] {
 			conversation.ActiveTurnID = turn.TurnID
 			conversation.Running = true
 		}

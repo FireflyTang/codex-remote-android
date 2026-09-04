@@ -333,6 +333,7 @@ type pendingWatchState struct {
 	State        string               `json:"state"`
 	HeadEventSeq uint64               `json:"headEventSeq"`
 	Error        *pendingRequestError `json:"error,omitempty"`
+	HostRunID    string               `json:"-"`
 }
 
 type pendingLocalState struct {
@@ -427,13 +428,14 @@ type conversationTurn struct {
 }
 
 type conversationState struct {
-	CodexID         string             `json:"codexId"`
-	ActiveTurnID    string             `json:"activeTurnId,omitempty"`
-	Running         bool               `json:"running"`
-	HistoryComplete bool               `json:"historyComplete"`
-	Turns           []conversationTurn `json:"turns"`
-	PendingRequests []pendingRequest   `json:"pendingRequests"`
-	PendingWatch    pendingWatchState  `json:"pendingWatch"`
+	CodexID                 string             `json:"codexId"`
+	ActiveTurnID            string             `json:"activeTurnId,omitempty"`
+	Running                 bool               `json:"running"`
+	HistoryComplete         bool               `json:"historyComplete"`
+	Turns                   []conversationTurn `json:"turns"`
+	PendingRequests         []pendingRequest   `json:"pendingRequests"`
+	PendingWatch            pendingWatchState  `json:"pendingWatch"`
+	SuppressedActiveTurnIDs map[string]bool    `json:"-"`
 }
 
 type protocolState struct {
@@ -492,7 +494,8 @@ type workspaceSession interface {
 }
 
 type pendingSession interface {
-	WatchPending(context.Context, string) (pendingWatchReset, *protocolPendingWatch, error)
+	ListHistory(context.Context, string) (conversationState, error)
+	WatchPending(context.Context, string, *pendingWatchCursor) (pendingWatchReset, *protocolPendingWatch, error)
 	UnwatchPending(context.Context, *protocolPendingWatch) error
 	RespondApproval(context.Context, string, string, string) (pendingResponseResult, error)
 	RespondUserInput(context.Context, string, string, []pendingUserInputAnswer) (pendingResponseResult, error)
@@ -558,6 +561,7 @@ type Core struct {
 	state                   state
 	cancel                  context.CancelFunc
 	pollCancel              context.CancelFunc
+	conversationPollTurnID  string
 	session                 session
 	runID                   uint64
 	conversationRunID       uint64
@@ -571,13 +575,14 @@ type Core struct {
 	pendingWatchRunID       uint64
 	pendingResponseCancels  map[string]context.CancelFunc
 	pendingRequestLocal     map[string]pendingLocalState
+	watchChunks             map[string]watchChunkState
 	notifier                *stateNotifier
 }
 
 // NewCore constructs a stopped core. Network activity starts only after a
 // configure command followed by start.
 func NewCore(platform Platform) *Core {
-	c := &Core{platform: platform, starter: productionStarter{platform: platform}, conversationPollTimeout: 10 * time.Minute, pendingResponseCancels: map[string]context.CancelFunc{}, pendingRequestLocal: map[string]pendingLocalState{}, notifier: &stateNotifier{platform: platform}}
+	c := &Core{platform: platform, starter: productionStarter{platform: platform}, conversationPollTimeout: 10 * time.Minute, pendingResponseCancels: map[string]context.CancelFunc{}, pendingRequestLocal: map[string]pendingLocalState{}, watchChunks: map[string]watchChunkState{}, notifier: &stateNotifier{platform: platform}}
 	c.state = state{Version: APIVersion, Phase: "idle", Protocol: protocolState{
 		WireVersion: ProtocolVersion, Subprotocol: WebSocketSubprotocol, ModuleVersion: protocolModuleVersion,
 	}}
@@ -880,6 +885,7 @@ func (c *Core) refresh(commandID string) string {
 		return c.reject(commandID, errors.New("cannot change conversation while a turn is running"))
 	}
 	c.interruptTurnID = ""
+	c.conversationPollTurnID = ""
 	sess := c.session
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	c.cancel = cancel
@@ -1526,6 +1532,7 @@ func (c *Core) cancelPendingLocked() chan struct{} {
 		delete(c.pendingResponseCancels, requestID)
 	}
 	c.pendingRequestLocal = map[string]pendingLocalState{}
+	c.watchChunks = map[string]watchChunkState{}
 	return done
 }
 
@@ -1538,8 +1545,10 @@ func (c *Core) mergePendingLocked(conversation *conversationState) {
 }
 
 func (c *Core) runPendingWatch(ctx context.Context, sess pendingSession, watchRunID uint64, codexID string) {
+	var cursor *pendingWatchCursor
 	for {
-		reset, watch, err := sess.WatchPending(ctx, codexID)
+		requestedCursor := cursor
+		start, watch, err := sess.WatchPending(ctx, codexID, cursor)
 		if err != nil {
 			if ctx.Err() == nil {
 				c.pendingWatchFailed(watchRunID, codexID, "watch_failed", err.Error())
@@ -1552,23 +1561,34 @@ func (c *Core) runPendingWatch(ctx context.Context, sess pendingSession, watchRu
 			c.unwatchPending(sess, watch)
 			return
 		}
-		for i := range reset.Requests {
-			if local, ok := c.pendingRequestLocal[reset.Requests[i].RequestID]; ok {
-				reset.Requests[i].InFlight, reset.Requests[i].Error = local.InFlight, local.Error
+		if start.Mode == "reset" || start.Mode == "" {
+			for i := range start.Requests {
+				if local, ok := c.pendingRequestLocal[start.Requests[i].RequestID]; ok {
+					start.Requests[i].InFlight, start.Requests[i].Error = local.InFlight, local.Error
+				}
 			}
+			c.state.Conversation.PendingRequests = start.Requests
+			c.applyWatchResetLocked(start)
 		}
-		c.state.Conversation.PendingRequests = reset.Requests
-		c.state.Conversation.PendingWatch = pendingWatchState{State: "watching", HeadEventSeq: reset.HeadEventSeq}
+		c.state.Conversation.PendingWatch = pendingWatchState{State: "watching", HeadEventSeq: start.HeadEventSeq, HostRunID: start.HostRunID}
+		cursor = &pendingWatchCursor{HostRunID: start.HostRunID, EventSeq: start.HeadEventSeq}
 		c.publishLocked()
 		c.mu.Unlock()
+		if (start.Mode == "reset" || start.Mode == "") && requestedCursor != nil {
+			go c.refreshWatchHistory(ctx, sess, watchRunID, codexID)
+		}
 
-		rebuild := false
+		rebuild, reconnect := false, false
 		for {
 			event, nextErr := watch.Next(ctx)
 			if nextErr != nil {
 				if ctx.Err() != nil {
 					c.unwatchPending(sess, watch)
 					return
+				}
+				if errors.Is(nextErr, errHostConnectionClosed) {
+					reconnect = true
+					break
 				}
 				code := "watch_failed"
 				if strings.Contains(nextErr.Error(), "overflow") {
@@ -1592,10 +1612,10 @@ func (c *Core) runPendingWatch(ctx context.Context, sess pendingSession, watchRu
 				break
 			}
 			if event.EventSeq <= head {
-				c.pendingWatchFailLocked("watch_gap", fmt.Sprintf("Watch event sequence did not advance: got %d after %d", event.EventSeq, head))
-				rebuild = true
+				// A replay may overlap events delivered just before a transport
+				// close. They were already reduced, so acknowledge them silently.
 				c.mu.Unlock()
-				break
+				continue
 			}
 			if event.EventSeq != head+1 {
 				c.pendingWatchFailLocked("watch_gap", fmt.Sprintf("Watch event gap: got %d after %d", event.EventSeq, head))
@@ -1605,14 +1625,30 @@ func (c *Core) runPendingWatch(ctx context.Context, sess pendingSession, watchRu
 			}
 			// Advance for every Event, not only PendingRequestUpdated.
 			c.state.Conversation.PendingWatch.HeadEventSeq = event.EventSeq
+			cursor = &pendingWatchCursor{HostRunID: c.state.Conversation.PendingWatch.HostRunID, EventSeq: event.EventSeq}
+			if err := c.applyWatchEventLocked(event); err != nil {
+				if errors.Is(err, errWatchedCodexForgotten) {
+					c.publishLocked()
+					c.mu.Unlock()
+					c.unwatchPending(sess, watch)
+					return
+				}
+				c.pendingWatchFailLocked("invalid_event", err.Error())
+				c.mu.Unlock()
+				break
+			}
 			if event.HasUpdate {
 				c.applyPendingUpdateLocked(event)
 			}
+			refreshHistory := watchEventNeedsHistoryRefresh(event)
 			c.publishLocked()
 			c.mu.Unlock()
+			if refreshHistory {
+				go c.refreshWatchHistory(ctx, sess, watchRunID, codexID)
+			}
 		}
 		c.unwatchPending(sess, watch)
-		if !rebuild || ctx.Err() != nil {
+		if (!rebuild && !reconnect) || ctx.Err() != nil {
 			return
 		}
 		c.mu.Lock()
@@ -1620,7 +1656,11 @@ func (c *Core) runPendingWatch(ctx context.Context, sess pendingSession, watchRu
 			c.mu.Unlock()
 			return
 		}
-		c.state.Conversation.PendingWatch = pendingWatchState{State: "loading"}
+		c.state.Conversation.PendingWatch.State = "loading"
+		c.state.Conversation.PendingWatch.Error = nil
+		if rebuild {
+			cursor = nil
+		}
 		c.publishLocked()
 		c.mu.Unlock()
 	}
@@ -1758,7 +1798,11 @@ func (c *Core) fetchConversation(ctx context.Context, cancel context.CancelFunc,
 		c.state.Phase, c.state.Error = "error", err.Error()
 	} else {
 		c.state.Phase, c.state.Error = "ready", ""
-		c.mergePendingLocked(&conversation)
+		if c.state.Conversation != nil && c.state.Conversation.CodexID == conversation.CodexID {
+			conversation = mergeConversationSnapshot(*c.state.Conversation, conversation)
+		} else {
+			c.mergePendingLocked(&conversation)
+		}
 		c.state.Conversation = &conversation
 	}
 	c.state.CommandID = commandID
@@ -1779,6 +1823,7 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 		return c.reject(commandID, errors.New("a turn is already running"))
 	}
 	c.interruptTurnID = ""
+	c.conversationPollTurnID = ""
 	ctx, cancel := context.WithTimeout(context.Background(), c.conversationPollTimeout)
 	c.pollCancel = cancel
 	c.conversationRunID++
@@ -1793,7 +1838,24 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 		turnID, err := sess.StartTurn(callCtx, codexID, p.Text, p.Options)
 		callCancel()
 		if err != nil {
-			c.finishConversationOperation(conversationRunID, commandID, err)
+			c.mu.Lock()
+			if c.conversationCurrentLocked(conversationRunID) && c.state.Conversation != nil && c.state.Conversation.CodexID == codexID && c.state.Conversation.Running && c.state.Conversation.ActiveTurnID != "" {
+				// WatchCodex is authoritative for an RPC with an unknown outcome:
+				// once the live stream confirms a running turn, a transport/RPC
+				// error must not roll that turn back or reopen the send gate.
+				liveTurnID := c.state.Conversation.ActiveTurnID
+				c.conversationPollTurnID = liveTurnID
+				c.state.CommandID, c.state.Phase, c.state.Error = commandID, "ready", ""
+				c.publishLocked()
+				c.mu.Unlock()
+				c.pollConversation(ctx, sess, conversationRunID, commandID, codexID, liveTurnID)
+				return
+			}
+			// Commit the failure under the same lock used to inspect live watch
+			// state. Otherwise a running event could arrive between the check and
+			// failure cleanup and be incorrectly rolled back.
+			c.finishConversationOperationLocked(conversationRunID, commandID, err)
+			c.mu.Unlock()
 			return
 		}
 		c.mu.Lock()
@@ -1804,8 +1866,18 @@ func (c *Core) startTurn(commandID string, p startTurnPayload) string {
 		if c.state.Conversation == nil {
 			c.state.Conversation = &conversationState{CodexID: codexID, Turns: []conversationTurn{}}
 		}
+		if conversationTurnTerminal(c.state.Conversation.Turns, turnID) {
+			c.pollCancel()
+			c.pollCancel = nil
+			c.conversationPollTurnID = ""
+			c.state.Phase = "ready"
+			c.publishLocked()
+			c.mu.Unlock()
+			return
+		}
 		c.state.Conversation.ActiveTurnID = turnID
 		c.state.Conversation.Running = true
+		c.conversationPollTurnID = turnID
 		c.state.Phase = "ready"
 		c.publishLocked()
 		c.mu.Unlock()
@@ -1836,6 +1908,7 @@ func (c *Core) interruptTurn(commandID, turnID string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.conversationPollTimeout)
 	c.pollCancel = cancel
+	c.conversationPollTurnID = turnID
 	c.conversationRunID++
 	conversationRunID := c.conversationRunID
 	c.interruptTurnID = turnID
@@ -1858,6 +1931,7 @@ func (c *Core) interruptTurn(commandID, turnID string) string {
 		c.mu.Lock()
 		if c.conversationCurrentLocked(conversationRunID) {
 			c.interruptTurnID = turnID
+			c.conversationPollTurnID = turnID
 		}
 		c.mu.Unlock()
 		c.pollConversation(ctx, sess, conversationRunID, commandID, codexID, turnID)
@@ -2046,6 +2120,17 @@ func (c *Core) pollConversation(ctx context.Context, sess session, conversationR
 		conversation, err := sess.ListHistory(callCtx, codexID)
 		cancel()
 		if err != nil {
+			if errors.Is(err, errHostConnectionClosed) && ctx.Err() == nil {
+				timer := time.NewTimer(conversationPollFastInterval)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					c.finishConversationOperation(conversationRunID, commandID, fmt.Errorf("conversation polling: %w", ctx.Err()))
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			c.finishConversationOperation(conversationRunID, commandID, err)
 			return
 		}
@@ -2060,7 +2145,11 @@ func (c *Core) pollConversation(ctx context.Context, sess session, conversationR
 			conversation.Running = true
 		}
 		c.state.CommandID, c.state.Phase, c.state.Error = commandID, "ready", ""
-		c.mergePendingLocked(&conversation)
+		if c.state.Conversation != nil && c.state.Conversation.CodexID == conversation.CodexID {
+			conversation = mergeConversationSnapshot(*c.state.Conversation, conversation)
+		} else {
+			c.mergePendingLocked(&conversation)
+		}
 		fingerprint := conversationPollFingerprint(conversation)
 		changed := previousFingerprint == "" || fingerprint != previousFingerprint
 		previousFingerprint = fingerprint
@@ -2070,6 +2159,7 @@ func (c *Core) pollConversation(ctx context.Context, sess session, conversationR
 		if terminal {
 			c.pollCancel()
 			c.pollCancel = nil
+			c.conversationPollTurnID = ""
 			if c.interruptTurnID == targetTurnID {
 				c.interruptTurnID = ""
 			}
@@ -2125,11 +2215,16 @@ func (c *Core) conversationCurrentLocked(conversationRunID uint64) bool {
 func (c *Core) finishConversationOperation(conversationRunID uint64, commandID string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.finishConversationOperationLocked(conversationRunID, commandID, err)
+}
+
+func (c *Core) finishConversationOperationLocked(conversationRunID uint64, commandID string, err error) {
 	if !c.conversationCurrentLocked(conversationRunID) {
 		return
 	}
 	c.pollCancel()
 	c.pollCancel = nil
+	c.conversationPollTurnID = ""
 	c.interruptTurnID = ""
 	if c.state.Conversation != nil {
 		c.state.Conversation.ActiveTurnID = ""
@@ -2152,6 +2247,7 @@ func (c *Core) stop(commandID string) string {
 		c.pollCancel()
 		c.pollCancel = nil
 	}
+	c.conversationPollTurnID = ""
 	if c.workspaceCancel != nil {
 		c.workspaceCancel()
 		c.workspaceCancel = nil

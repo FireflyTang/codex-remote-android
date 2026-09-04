@@ -9,9 +9,13 @@ import androidx.lifecycle.viewModelScope
 import com.firefly.codexremote.mobilecore.Core
 import com.firefly.codexremote.mobilecore.Mobilecore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -115,9 +119,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val foregroundRecoveryTracker = ForegroundRecoveryTracker()
     private val projectOperationSingleFlight = ProjectOperationSingleFlight()
     private val diagnosticActionTracker = DiagnosticActionTracker()
+    private val codexDrafts = ConcurrentHashMap<String, String>()
+    private val codexDraftVersions = ConcurrentHashMap<String, Long>()
+    private val attemptedPersistedSelections = ConcurrentHashMap.newKeySet<String>()
+    private val forgetPersistenceTracker = ForgetPersistenceTracker()
+    private val sendDraftTracker = SendDraftTracker()
+    private val codexPreferenceWrites = Channel<CodexPreferenceWrite>(Channel.UNLIMITED)
+    private val latestDraftWrite = LatestCodexDraftWrite()
+    private var draftPersistenceJob: Job? = null
+    @Volatile private var persistedSelectedCodexId: String? = null
+    @Volatile private var codexStateLoaded = false
 
     init {
         diagnosticLog.append("app.started", "version=$clientVersion")
+        viewModelScope.launch {
+            for (write in codexPreferenceWrites) {
+                when (write) {
+                    is CodexPreferenceWrite.Draft -> hostPreferences.setCodexDraft(write.codexId, write.draft)
+                    is CodexPreferenceWrite.Selected -> hostPreferences.setSelectedCodexId(write.codexId)
+                    is CodexPreferenceWrite.Forget -> hostPreferences.forgetCodex(write.codexId)
+                }
+            }
+        }
         viewModelScope.launch {
             hostPreferences.hostAddress.collect { saved ->
                 _uiState.update { it.copy(hostAddress = saved) }
@@ -127,6 +150,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             hostPreferences.lastProjectPath.collect { saved ->
                 _uiState.update { it.copy(lastProjectPath = saved) }
             }
+        }
+        viewModelScope.launch {
+            val saved = hostPreferences.codexState.first()
+            saved.drafts.forEach { (codexId, draft) -> codexDrafts.putIfAbsent(codexId, draft) }
+            val currentOpenCodexId = uiState.value.openCodexId
+            persistedSelectedCodexId = currentOpenCodexId ?: saved.selectedCodexId.takeIf { it.isNotBlank() }
+            codexStateLoaded = true
+            _uiState.update { current ->
+                val openCodexId = current.openCodexId
+                if (openCodexId == null || current.draft.isNotEmpty()) current
+                else current.copy(draft = draftForCodex(codexDrafts, openCodexId))
+            }
+            val forgottenCodexId = authoritativeForgottenCodex(
+                uiState.value,
+                persistedSelectedCodexId,
+                uiState.value.core,
+            )
+            if (forgottenCodexId != null) clearForgottenCodex(forgottenCodexId)
+            else restorePersistedConversationIfReady()
         }
         acceptCoreState(core.state())
         networkMonitor.start()
@@ -349,10 +391,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun unmanageCodex(codexId: String) = dispatchCodexAction("unmanage_codex", codexId)
 
-    fun forgetCodex(codexId: String) = dispatchCodexAction("forget_codex", codexId)
+    fun forgetCodex(codexId: String) {
+        val normalizedId = codexId.trim()
+        if (normalizedId.isEmpty()) return
+        val command = coreCommand("forget_codex", JSONObject().put("codexId", normalizedId))
+        val coreState = uiState.value.core
+        forgetPersistenceTracker.track(
+            commandId = command.getString("id"),
+            codexId = normalizedId,
+            wasCoreSelected = coreState.selectedCodexId == normalizedId ||
+                coreState.conversation?.codexId == normalizedId,
+        )
+        viewModelScope.launch(Dispatchers.IO) { dispatchTracked(command, "session.forget") }
+    }
 
     fun openConversation(codexId: String) {
         if (codexId.isBlank()) return
+        flushPendingDraftWrite()
         val openingFromProjectDialog = uiState.value.projectDialogOpen
         if (openingFromProjectDialog && !projectOperationSingleFlight.tryAcquire()) return
         val managedProjectCommand = if (openingFromProjectDialog) {
@@ -361,6 +416,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 openCodexId = if (managedProjectCommand == null) codexId else it.openCodexId,
+                draft = if (managedProjectCommand == null) draftForCodex(codexDrafts, codexId) else it.draft,
                 pendingProjectCommandId = managedProjectCommand?.getString("id") ?: it.pendingProjectCommandId,
                 pendingProjectCommandStage = if (managedProjectCommand != null) ProjectStageSelection else it.pendingProjectCommandStage,
                 pendingProjectAction = if (managedProjectCommand != null) "select_codex" else it.pendingProjectAction,
@@ -392,6 +448,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 submittingRequestIds = emptySet(),
             )
         }
+        if (managedProjectCommand == null) rememberSelectedCodex(codexId)
         viewModelScope.launch(Dispatchers.IO) {
             if (managedProjectCommand != null) dispatchTracked(managedProjectCommand, "project.selection")
             else dispatch("select_codex", JSONObject().put("codexId", codexId))
@@ -399,6 +456,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun closeConversation() {
+        flushPendingDraftWrite()
         _uiState.update {
             it.copy(
                 openCodexId = null,
@@ -697,7 +755,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setDraft(value: String) {
-        _uiState.update { it.copy(draft = value) }
+        val codexId = uiState.value.openCodexId ?: return
+        codexDraftVersions.compute(codexId) { _, version -> (version ?: 0L) + 1L }
+        if (value.isEmpty()) codexDrafts.remove(codexId) else codexDrafts[codexId] = value
+        _uiState.update { current ->
+            if (current.openCodexId == codexId) current.copy(draft = value) else current
+        }
+        latestDraftWrite.update(codexId, value)
+        draftPersistenceJob?.cancel()
+        draftPersistenceJob = viewModelScope.launch {
+            delay(DraftPersistenceDebounceMs)
+            draftPersistenceJob = null
+            enqueuePendingDraftWrite()
+        }
     }
 
     fun sendMessage() {
@@ -705,9 +775,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val text = state.draft.trim()
         val conversation = state.core.conversation
         if (text.isEmpty() || conversation?.running == true || conversation?.codexId != state.openCodexId) return
+        val codexId = state.openCodexId ?: return
+        val command = coreCommand("start_turn", JSONObject().put("text", text))
+        flushPendingDraftWrite()
+        sendDraftTracker.track(
+            commandId = command.getString("id"),
+            codexId = codexId,
+            originalDraft = state.draft,
+            draftVersion = codexDraftVersions[codexId] ?: 0L,
+        )
+        codexDrafts.remove(codexId)
         _uiState.update { it.copy(draft = "", stoppingTurn = false) }
         viewModelScope.launch(Dispatchers.IO) {
-            dispatch("start_turn", JSONObject().put("text", text))
+            dispatchTracked(command, "general")
         }
     }
 
@@ -853,6 +933,78 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { hostPreferences.setLastProjectPath(path) }
     }
 
+    private fun rememberSelectedCodex(codexId: String) {
+        persistedSelectedCodexId = codexId
+        attemptedPersistedSelections += codexId
+        codexPreferenceWrites.trySend(CodexPreferenceWrite.Selected(codexId))
+    }
+
+    private fun flushPendingDraftWrite() {
+        draftPersistenceJob?.cancel()
+        draftPersistenceJob = null
+        enqueuePendingDraftWrite()
+    }
+
+    private fun enqueuePendingDraftWrite() {
+        latestDraftWrite.take()?.let { (codexId, draft) ->
+            codexPreferenceWrites.trySend(CodexPreferenceWrite.Draft(codexId, draft))
+        }
+    }
+
+    private fun discardPendingDraftWrite(codexId: String) {
+        if (latestDraftWrite.discard(codexId)) {
+            draftPersistenceJob?.cancel()
+            draftPersistenceJob = null
+        }
+    }
+
+    private fun clearForgottenCodex(codexId: String) {
+        discardPendingDraftWrite(codexId)
+        sendDraftTracker.forgetCodex(codexId)
+        codexDrafts.remove(codexId)
+        codexDraftVersions.remove(codexId)
+        if (persistedSelectedCodexId == codexId) persistedSelectedCodexId = null
+        if (uiState.value.openCodexId == codexId) closeConversation()
+        codexPreferenceWrites.trySend(CodexPreferenceWrite.Forget(codexId))
+    }
+
+    private fun resolveSentDraft(resolution: SendDraftResolution) {
+        val latestVersion = codexDraftVersions[resolution.codexId] ?: 0L
+        if (!shouldApplySendDraftResolution(resolution, latestVersion)) return
+        if (resolution.accepted) {
+            codexDrafts.remove(resolution.codexId)
+            codexPreferenceWrites.trySend(CodexPreferenceWrite.Draft(resolution.codexId, ""))
+        } else {
+            codexDrafts[resolution.codexId] = resolution.originalDraft
+            _uiState.update { current ->
+                if (current.openCodexId == resolution.codexId && current.draft.isEmpty()) {
+                    current.copy(draft = resolution.originalDraft)
+                } else current
+            }
+            codexPreferenceWrites.trySend(
+                CodexPreferenceWrite.Draft(resolution.codexId, resolution.originalDraft),
+            )
+        }
+    }
+
+    private fun restorePersistedConversationIfReady() {
+        val codexId = persistedCodexToRestore(
+            uiState.value,
+            persistedSelectedCodexId,
+            codexStateLoaded,
+            attemptedPersistedSelections,
+        ) ?: return
+        if (!attemptedPersistedSelections.add(codexId)) return
+        _uiState.update { current ->
+            if (current.openCodexId == null) {
+                current.copy(openCodexId = codexId, draft = draftForCodex(codexDrafts, codexId))
+            } else current
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            dispatch("select_codex", JSONObject().put("codexId", codexId))
+        }
+    }
+
     private fun acceptCoreState(raw: String) {
         val decoded = runCatching { decodeCoreState(raw) }.getOrElse { error ->
             CoreState(phase = "error", error = "无法解析 MobileCore 状态：${error.message}")
@@ -872,6 +1024,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         val reconnectForeground = foregroundResolution is ForegroundRecoveryResolution.Reconnect
+        val forgottenCodexId = if (revisionEligible) {
+            forgetPersistenceTracker.onCoreState(decoded)
+                ?: authoritativeForgottenCodex(_uiState.value, persistedSelectedCodexId, decoded)
+        } else null
+        val sentDraftResolution = if (revisionEligible) sendDraftTracker.onCoreState(decoded) else null
         if (revisionEligible) {
             coreStateDiagnosticRecorder.record(decoded)
             diagnosticActionTracker.consumeTerminal(decoded, _uiState.value)?.let { tracked ->
@@ -882,6 +1039,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         var refreshWorkspaceDirectory: Pair<String, String>? = null
         var recoverWorkspaceAfterUploadFailure: Pair<String, String>? = null
         var projectPathToRemember: String? = null
+        var selectedCodexToRemember: String? = null
         var selectProjectAfterMutation: JSONObject? = null
         var projectFlowFinished = false
         _uiState.update { current ->
@@ -902,6 +1060,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } else null
                 if (completedProject) {
                     projectPathToRemember = successfulProjectPath(current, decoded)
+                    selectedCodexToRemember = projectResolution.codexId
                 }
                 val directoryResolution = resolveDirectoryResult(
                     current.projectPath, current.pendingDirectoryCommandId, decoded,
@@ -967,6 +1126,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 val recoveryFailed = foregroundResolution as? ForegroundRecoveryResolution.Failed
                 val recoveryFinished = foregroundResolution is ForegroundRecoveryResolution.Finished || recoveryFailed != null
+                val nextOpenCodexId = when {
+                    recoveryFailed != null -> null
+                    foregroundResolution is ForegroundRecoveryResolution.Finished &&
+                        foregroundResolution.codexId != null -> foregroundResolution.codexId
+                    completedProject -> projectResolution.codexId
+                    else -> current.openCodexId
+                }
                 var next = current.copy(
                     core = decoded,
                     userInputDrafts = decodedActiveConversation?.let { conversation ->
@@ -1071,12 +1237,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         foregroundResolution is ForegroundRecoveryResolution.Finished -> ""
                         else -> current.foregroundRecoveryError
                     },
-                    openCodexId = when {
-                        recoveryFailed != null -> null
-                        foregroundResolution is ForegroundRecoveryResolution.Finished &&
-                            foregroundResolution.codexId != null -> foregroundResolution.codexId
-                        completedProject -> projectResolution.codexId
-                        else -> current.openCodexId
+                    openCodexId = nextOpenCodexId,
+                    draft = when {
+                        nextOpenCodexId == null -> ""
+                        nextOpenCodexId != current.openCodexId -> draftForCodex(codexDrafts, nextOpenCodexId)
+                        else -> current.draft
                     },
                     conversationPage = if (recoveryFinished) ConversationPage.CONVERSATION else current.conversationPage,
                     workspaceEditorOpen = when {
@@ -1093,6 +1258,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             Log.e(CoreLogTag, message)
         }
         projectPathToRemember?.let(::rememberProjectPath)
+        selectedCodexToRemember?.let(::rememberSelectedCodex)
+        sentDraftResolution?.let(::resolveSentDraft)
+        forgottenCodexId?.let(::clearForgottenCodex)
+        restorePersistedConversationIfReady()
         if (projectFlowFinished) projectOperationSingleFlight.release()
         selectProjectAfterMutation?.let { command ->
             viewModelScope.launch(Dispatchers.IO) {
@@ -1136,6 +1305,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        flushPendingDraftWrite()
+        codexPreferenceWrites.close()
         networkMonitor.close()
         core.close()
         super.onCleared()
@@ -1143,6 +1314,124 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 }
 
 internal const val CoreLogTag = "CodexRemote"
+private const val DraftPersistenceDebounceMs = 250L
+
+private sealed interface CodexPreferenceWrite {
+    data class Draft(val codexId: String, val draft: String) : CodexPreferenceWrite
+    data class Selected(val codexId: String) : CodexPreferenceWrite
+    data class Forget(val codexId: String) : CodexPreferenceWrite
+}
+
+internal class LatestCodexDraftWrite {
+    private var pending: Pair<String, String>? = null
+
+    @Synchronized
+    fun update(codexId: String, draft: String) {
+        pending = codexId to draft
+    }
+
+    @Synchronized
+    fun take(): Pair<String, String>? = pending.also { pending = null }
+
+    @Synchronized
+    fun discard(codexId: String): Boolean {
+        if (pending?.first != codexId) return false
+        pending = null
+        return true
+    }
+}
+
+internal class ForgetPersistenceTracker {
+    private data class PendingForget(val codexId: String, val wasCoreSelected: Boolean)
+
+    private val pending = ConcurrentHashMap<String, PendingForget>()
+
+    fun track(commandId: String, codexId: String, wasCoreSelected: Boolean = false) {
+        pending[commandId] = PendingForget(codexId, wasCoreSelected)
+    }
+
+    fun onCoreState(state: CoreState): String? {
+        if (state.phase != "ready" && state.error.isBlank()) return null
+        val tracked = pending.remove(state.commandId) ?: return null
+        val refreshFailedAfterSelectedForget = state.error.isNotBlank() && tracked.wasCoreSelected &&
+            state.selectedCodexId.isBlank() && state.conversation == null
+        return tracked.codexId.takeIf {
+            (state.phase == "ready" && state.error.isBlank()) || refreshFailedAfterSelectedForget
+        }
+    }
+}
+
+internal data class SendDraftResolution(
+    val codexId: String,
+    val originalDraft: String,
+    val draftVersion: Long,
+    val accepted: Boolean,
+)
+
+internal class SendDraftTracker {
+    private data class PendingSend(
+        val codexId: String,
+        val originalDraft: String,
+        val draftVersion: Long,
+    )
+
+    private val pending = ConcurrentHashMap<String, PendingSend>()
+
+    fun track(commandId: String, codexId: String, originalDraft: String, draftVersion: Long) {
+        pending[commandId] = PendingSend(codexId, originalDraft, draftVersion)
+    }
+
+    fun onCoreState(state: CoreState): SendDraftResolution? {
+        val tracked = pending[state.commandId] ?: return null
+        val accepted = state.phase == "ready" && state.error.isBlank() &&
+            state.conversation?.codexId == tracked.codexId && state.conversation.running &&
+            state.conversation.activeTurnId.isNotBlank()
+        val failed = state.phase == "error" || state.error.isNotBlank()
+        if (!accepted && !failed) return null
+        if (!pending.remove(state.commandId, tracked)) return null
+        return SendDraftResolution(
+            codexId = tracked.codexId,
+            originalDraft = tracked.originalDraft,
+            draftVersion = tracked.draftVersion,
+            accepted = accepted,
+        )
+    }
+
+    fun forgetCodex(codexId: String) {
+        pending.entries.removeIf { it.value.codexId == codexId }
+    }
+}
+
+internal fun draftForCodex(drafts: Map<String, String>, codexId: String?): String =
+    codexId?.let(drafts::get).orEmpty()
+
+internal fun persistedCodexToRestore(
+    state: AppUiState,
+    persistedCodexId: String?,
+    preferencesLoaded: Boolean,
+    attemptedCodexIds: Set<String>,
+): String? {
+    val codexId = persistedCodexId?.takeIf { it.isNotBlank() } ?: return null
+    return codexId.takeIf {
+        preferencesLoaded && state.openCodexId == null && !state.projectDialogOpen &&
+            state.core.phase == "ready" && state.core.codexes.any { codex -> codex.id == codexId } &&
+            codexId !in attemptedCodexIds
+    }
+}
+
+internal fun authoritativeForgottenCodex(
+    current: AppUiState,
+    persistedSelectedCodexId: String?,
+    decoded: CoreState,
+): String? {
+    val expectedCodexId = current.openCodexId ?: persistedSelectedCodexId ?: return null
+    return expectedCodexId.takeIf {
+        decoded.phase == "ready" && decoded.codexes.none { codex -> codex.id == expectedCodexId }
+    }
+}
+
+internal fun shouldApplySendDraftResolution(resolution: SendDraftResolution, latestDraftVersion: Long): Boolean =
+    resolution.draftVersion == latestDraftVersion
 
 internal fun effectiveClientVersion(installedVersionName: String?): String =
     installedVersionName?.trim().orEmpty().ifBlank { "unknown" }

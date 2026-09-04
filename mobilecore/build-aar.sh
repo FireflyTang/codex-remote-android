@@ -80,6 +80,12 @@ fi
 module_dir="$work_dir/module"
 runtime_dir="$work_dir/mobile-runtime"
 staged_aar="$work_dir/mobilecore.aar"
+gomobile_goflags=${GOFLAGS:-}
+while [[ $gomobile_goflags =~ (^|[[:space:]])-buildvcs(=[^[:space:]]+)?($|[[:space:]]) ]]; do
+  matched_flag=${BASH_REMATCH[0]}
+  gomobile_goflags=${gomobile_goflags/"$matched_flag"/"${BASH_REMATCH[1]}${BASH_REMATCH[3]}"}
+done
+gomobile_goflags="${gomobile_goflags:+$gomobile_goflags }-buildvcs=false"
 mkdir -p "$module_dir"
 cp "$root_dir"/*.go "$root_dir/go.mod" "$root_dir/go.sum" "$module_dir/"
 cp -a "$tools_dir/mobile-runtime" "$runtime_dir"
@@ -95,6 +101,7 @@ cp -a "$tools_dir/mobile-runtime" "$runtime_dir"
   PATH="$tools_dir/bin:$(dirname "$go_bin"):$PATH" \
   ANDROID_HOME="$android_home" \
   ANDROID_NDK_HOME="$android_ndk_home" \
+  GOFLAGS="$gomobile_goflags" \
   GOMOBILE_LOCAL_MODULE_DIR="$module_dir" \
   GOMOBILE_LOCAL_MODULE_PATH=github.com/FireflyTang/codex-remote-android/mobilecore \
   GOMOBILE_BIND_RUNTIME_DIR="$runtime_dir" \

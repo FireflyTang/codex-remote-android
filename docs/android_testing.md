@@ -46,10 +46,12 @@ same shell. This keeps the repository's Android user home and debug keystore in
 use, avoiding install failures caused by signing debug builds with a different
 debug keystore.
 
-The AVD is a resource-conscious approximation of a vivo X200 Ultra: API 36,
-x86_64, 1080x2400 at 420 dpi, 2 cores, 2 GiB RAM, and a 256 MiB VM heap. The
-existing data-partition setting is left unchanged. This is not a vendor
-firmware/device-behavior replica.
+The AVD is a resource-conscious approximation of a vivo X200 Ultra, not a vendor
+firmware/device-behavior replica. The stable final connected-test profile used
+API 36 x86_64 with a configured 1536 MiB RAM, 2 cores, 720x1600 at 320 dpi,
+SwiftShader GLES, and Vulkan explicitly disabled. The emulator raised its
+effective memory allocation; the guest reported `MemTotal` of approximately
+2532296 kB. The existing data-partition setting is left unchanged.
 `emulator-start.sh` updates these keys in an existing AVD before every start, so
 an older high-memory profile does not silently remain active. It is headless by
 default; pass `--window` for a GUI. It prints the effective profile and guest
@@ -64,12 +66,22 @@ The running guest reported a 4096-byte page size. The packaged arm64
 successfully on the tested physical device, but neither fact substitutes for a
 test on a 16 KB guest.
 
-The latest complete baseline passed all 72 MobileCore Go tests in both normal
-and race-enabled runs, 117/117 JVM tests, and 47/47 connected tests on the
-low-memory API 36 AVD.
-The emulator suite covers connection/error presentation, project and session
-states, session management, rich timeline rendering, pending approval/user
-input, workspace and SAF boundaries, diagnostic export, and foreground recovery.
+The current v0.3.0 candidate has passed the complete MobileCore Go suite in both
+normal and race-enabled runs; `go test -json -count=1 ./...` reported 132
+passing Test/subtest events. JVM tests passed 129/129, and the API 36 low-resource
+connected suite passed 51/51. Existing automation covers connection/error
+presentation, project and session states, session management, rich timeline
+rendering, pending approval/user input, workspace and SAF boundaries, diagnostic
+export, foreground recovery, process recreation, and the task-context page.
+
+The v0.3.0 candidate adds three focused flows. The open conversation consumes
+Host watch events, resumes from its known cursor after a reconnect, and
+reconciles history after a turn finishes. The selected Codex and unsent drafts
+are persisted per Codex so process recreation can restore the previous working
+context. A third horizontally navigable task-context page summarizes cwd,
+Codex/turn state, pending-request counts, active-turn file changes, and filtered,
+deduplicated warnings and identifiers; it does not add protocol fields or file
+links.
 
 Foreground recovery is deliberately bounded. After the app has been in the
 background for at least 10 seconds, returning to the foreground first performs

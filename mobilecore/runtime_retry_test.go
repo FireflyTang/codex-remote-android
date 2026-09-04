@@ -9,9 +9,47 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestLiveSessionReconnectSwapsOnceForConcurrentWatchFailures(t *testing.T) {
+	failed := new(protocolClient)
+	replacement := new(protocolClient)
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	session := &liveSession{client: failed, redial: func(context.Context) (*protocolClient, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return replacement, nil
+	}}
+	errs := make(chan error, 2)
+	go func() { errs <- session.reconnectClient(context.Background(), failed) }()
+	<-started
+	go func() { errs <- session.reconnectClient(context.Background(), failed) }()
+	close(release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 1 || session.currentClient() != replacement {
+		t.Fatalf("redials=%d client=%p want=%p", calls.Load(), session.currentClient(), replacement)
+	}
+}
+
+func TestReconnectDialRetriesServerUnavailableButNotProtocolMismatch(t *testing.T) {
+	if !isRetryableReconnectDial(&hostDialError{status: 503, err: errors.New("unavailable")}, nil) {
+		t.Fatal("503 should be retryable after an established connection")
+	}
+	if isRetryableReconnectDial(errors.New("Host protocol mismatch"), nil) {
+		t.Fatal("protocol mismatch must not retry forever")
+	}
+}
 
 func TestDialWebSocketClassifiesNoResponseAsTransientStatusZero(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

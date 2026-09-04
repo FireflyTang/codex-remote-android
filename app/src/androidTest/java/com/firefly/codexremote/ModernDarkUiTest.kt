@@ -5,10 +5,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.platform.LocalDensity
@@ -91,8 +94,12 @@ class ModernDarkUiTest {
         compose.onNodeWithTag("show-conversation").assertIsDisplayed()
         compose.onNodeWithTag("show-conversation").assertIsSelected()
         compose.onNodeWithTag("show-workspace").assertIsDisplayed()
+        val history = compose.onNodeWithTag("conversation-history-list")
+        history.performScrollToNode(hasText("检查项目并修复问题"))
         compose.onNodeWithText("检查项目并修复问题").assertIsDisplayed()
+        history.performScrollToNode(hasText("已完成修改。", substring = true))
         compose.onNodeWithText("已完成修改。", substring = true).assertIsDisplayed()
+        history.performScrollToNode(hasContentDescription("展开思考过程"))
         compose.onNodeWithContentDescription("展开思考过程").assertIsDisplayed()
         compose.onNodeWithContentDescription("发送消息").assertIsDisplayed()
         compose.onNodeWithContentDescription("导出诊断日志").assertIsDisplayed()

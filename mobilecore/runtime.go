@@ -54,7 +54,11 @@ func (e *hostDialError) Unwrap() error { return e.err }
 
 type liveSession struct {
 	tailnet         *tsnet.Server
+	cfg             configPayload
+	mu              sync.RWMutex
+	reconnectMu     sync.Mutex
 	client          *protocolClient
+	redial          func(context.Context) (*protocolClient, error)
 	ips             []string
 	releaseInjector func()
 	closeOnce       sync.Once
@@ -114,7 +118,10 @@ func (s productionStarter) Start(ctx context.Context, cfg configPayload, progres
 	if err != nil {
 		return nil, snapshot{}, fmt.Errorf("%w; %s", err, tailnetEndpointDiagnostic(ctx, server, status, cfg.HostEndpoint))
 	}
-	ls := &liveSession{tailnet: server, client: client, ips: statusIPs(status), releaseInjector: releaseInjector}
+	ls := &liveSession{tailnet: server, cfg: cfg, client: client, ips: statusIPs(status), releaseInjector: releaseInjector}
+	ls.redial = func(redialCtx context.Context) (*protocolClient, error) {
+		return dialProtocol(redialCtx, cfg, server.Dial)
+	}
 	snap, err := ls.Refresh(ctx)
 	if err != nil {
 		_ = client.Close()
@@ -286,74 +293,140 @@ func statusIPs(status *ipnstate.Status) []string {
 }
 
 func (s *liveSession) Refresh(ctx context.Context) (snapshot, error) {
-	host, codexes, err := s.client.Fetch(ctx)
+	client := s.currentClient()
+	host, codexes, err := client.Fetch(ctx)
 	if err != nil {
 		return snapshot{}, err
 	}
-	return snapshot{TailnetIPs: append([]string(nil), s.ips...), ServerHello: s.client.ServerHelloJSON(), Host: host, Codexes: codexes}, nil
+	return snapshot{TailnetIPs: append([]string(nil), s.ips...), ServerHello: client.ServerHelloJSON(), Host: host, Codexes: codexes}, nil
+}
+
+func (s *liveSession) currentClient() *protocolClient {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.client
+}
+
+func (s *liveSession) reconnectClient(ctx context.Context, failed *protocolClient) error {
+	s.reconnectMu.Lock()
+	defer s.reconnectMu.Unlock()
+	if current := s.currentClient(); current != failed {
+		return nil
+	}
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, hostDialAttemptTimeout)
+		redial := s.redial
+		if redial == nil {
+			redial = func(redialCtx context.Context) (*protocolClient, error) {
+				return dialProtocol(redialCtx, s.cfg, s.tailnet.Dial)
+			}
+		}
+		client, err := redial(attemptCtx)
+		attemptErr := attemptCtx.Err()
+		cancel()
+		if err == nil {
+			s.mu.Lock()
+			if s.client == failed {
+				s.client = client
+			} else {
+				_ = client.Close()
+			}
+			s.mu.Unlock()
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !isRetryableReconnectDial(err, attemptErr) {
+			return err
+		}
+		if err := waitHostDialRetry(ctx, hostDialRetryDelay); err != nil {
+			return err
+		}
+	}
+}
+
+func isRetryableReconnectDial(err, attemptErr error) bool {
+	var dialErr *hostDialError
+	if errors.As(err, &dialErr) && dialErr.status >= 500 {
+		return true
+	}
+	return isRetryableInitialHostDial(err, attemptErr)
 }
 
 func (s *liveSession) ListHistory(ctx context.Context, codexID string) (conversationState, error) {
-	return s.client.ListHistory(ctx, codexID)
+	return s.currentClient().ListHistory(ctx, codexID)
 }
 
 func (s *liveSession) StartTurn(ctx context.Context, codexID, text string, options *turnOptionsPayload) (string, error) {
-	return s.client.StartTurn(ctx, codexID, text, options)
+	return s.currentClient().StartTurn(ctx, codexID, text, options)
 }
 
 func (s *liveSession) InterruptTurn(ctx context.Context, codexID, turnID string) (string, error) {
-	return s.client.InterruptTurn(ctx, codexID, turnID)
+	return s.currentClient().InterruptTurn(ctx, codexID, turnID)
 }
 
-func (s *liveSession) WatchPending(ctx context.Context, codexID string) (pendingWatchReset, *protocolPendingWatch, error) {
-	return s.client.WatchPending(ctx, codexID)
+func (s *liveSession) WatchPending(ctx context.Context, codexID string, cursor *pendingWatchCursor) (pendingWatchReset, *protocolPendingWatch, error) {
+	for {
+		client := s.currentClient()
+		start, watch, err := client.WatchPending(ctx, codexID, cursor)
+		if err == nil {
+			return start, watch, nil
+		}
+		if !errors.Is(err, errHostConnectionClosed) {
+			return pendingWatchReset{}, nil, err
+		}
+		if err := s.reconnectClient(ctx, client); err != nil {
+			return pendingWatchReset{}, nil, err
+		}
+	}
 }
 
 func (s *liveSession) UnwatchPending(ctx context.Context, watch *protocolPendingWatch) error {
-	return s.client.UnwatchPending(ctx, watch)
+	return watch.client.UnwatchPending(ctx, watch)
 }
 
 func (s *liveSession) RespondApproval(ctx context.Context, codexID, approvalID, decision string) (pendingResponseResult, error) {
-	return s.client.RespondApproval(ctx, codexID, approvalID, decision)
+	return s.currentClient().RespondApproval(ctx, codexID, approvalID, decision)
 }
 
 func (s *liveSession) RespondUserInput(ctx context.Context, codexID, requestID string, answers []pendingUserInputAnswer) (pendingResponseResult, error) {
-	return s.client.RespondUserInput(ctx, codexID, requestID, answers)
+	return s.currentClient().RespondUserInput(ctx, codexID, requestID, answers)
 }
 
 func (s *liveSession) ListDirectories(ctx context.Context, parentPath string) (directoryListing, error) {
-	return s.client.ListDirectories(ctx, parentPath)
+	return s.currentClient().ListDirectories(ctx, parentPath)
 }
 
 func (s *liveSession) ListSessionCandidates(ctx context.Context, cwd string) (sessionCandidatesState, error) {
-	return s.client.ListSessionCandidates(ctx, cwd)
+	return s.currentClient().ListSessionCandidates(ctx, cwd)
 }
 
 func (s *liveSession) CreateCodex(ctx context.Context, p createCodexPayload) (string, error) {
-	return s.client.CreateCodex(ctx, p)
+	return s.currentClient().CreateCodex(ctx, p)
 }
 
 func (s *liveSession) ImportSession(ctx context.Context, p importSessionPayload) (string, error) {
-	return s.client.ImportSession(ctx, p)
+	return s.currentClient().ImportSession(ctx, p)
 }
 
 func (s *liveSession) RenameCodex(ctx context.Context, p renameCodexPayload) error {
-	return s.client.RenameCodex(ctx, p)
+	return s.currentClient().RenameCodex(ctx, p)
 }
 
 func (s *liveSession) UnmanageCodex(ctx context.Context, codexID string) error {
-	return s.client.UnmanageCodex(ctx, codexID)
+	return s.currentClient().UnmanageCodex(ctx, codexID)
 }
 
 func (s *liveSession) ForgetCodex(ctx context.Context, codexID string) error {
-	return s.client.ForgetCodex(ctx, codexID)
+	return s.currentClient().ForgetCodex(ctx, codexID)
 }
 
 func (s *liveSession) Close() error {
 	s.closeOnce.Do(func() {
 		// Close the WebSocket first so an in-flight Refresh/write is interrupted
 		// before shutting down the userspace Tailnet.
-		_ = s.client.Close()
+		_ = s.currentClient().Close()
 		if s.releaseInjector != nil {
 			s.releaseInjector()
 		}
